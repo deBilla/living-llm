@@ -77,6 +77,32 @@ def _print_web_knowledge(memories: list, console, use_rich: bool):
         print()
 
 
+def _print_recall_debug(info: dict, console, use_rich: bool):
+    clarity_icons = {"clear": "CLEAR", "blurry": "BLURRY", "absent": "ABSENT"}
+    tag = clarity_icons.get(info["clarity"], info["clarity"])
+    lines = [
+        f"Clarity: {tag}  |  Confidence: {info['confidence']:.2f}  |  Memories found: {info['memories_found']}",
+        f"Search performed: {info['search_performed']}  |  Memory updated: {info['memory_updated']}",
+    ]
+    if info["missing_details"]:
+        lines.append(f"Missing: {', '.join(info['missing_details'])}")
+    if info["suggested_search"]:
+        lines.append(f"Suggested search: {info['suggested_search']}")
+    if info["memory_texts"]:
+        lines.append("\nRetrieved memories:")
+        for t in info["memory_texts"]:
+            lines.append(f"  - {t}")
+    if info["web_context"]:
+        lines.append(f"\nWeb context:\n{info['web_context'][:500]}")
+
+    text = "\n".join(lines)
+    if use_rich:
+        from rich.panel import Panel
+        console.print(Panel(text, title="augmented recall", border_style="magenta"))
+    else:
+        print(f"\n--- Augmented Recall ---\n{text}\n")
+
+
 def _print_comparison(result: dict, console, use_rich: bool):
     if use_rich:
         from rich.panel import Panel
@@ -108,6 +134,8 @@ def run_terminal():
                 "[bold]Living LLM[/bold] — A continuously learning language model\n"
                 "  [bold]/memory[/bold]           inspect memory state\n"
                 "  [bold]/search <query>[/bold]   force a web search\n"
+                "  [bold]/recall <query>[/bold]   debug augmented recall assessment\n"
+                "  [bold]/sharpen[/bold]          enrich blurry memories with web search\n"
                 "  [bold]/knowledge[/bold]        show stored web knowledge\n"
                 "  [bold]/knowledge clear[/bold]  clear all web knowledge\n"
                 "  [bold]/knowledge decay[/bold]  run confidence decay\n"
@@ -125,6 +153,8 @@ def run_terminal():
             print("  Living LLM — A continuously learning language model")
             print("  /memory              — inspect memory state")
             print("  /search <query>      — force web search")
+            print("  /recall <query>      — debug augmented recall")
+            print("  /sharpen             — enrich blurry memories")
             print("  /knowledge           — show web knowledge")
             print("  /knowledge clear     — clear web knowledge")
             print("  /knowledge decay     — run confidence decay")
@@ -239,6 +269,22 @@ def run_terminal():
             engine.decay_web_knowledge()
             continue
 
+        if user_input.lower().startswith("/recall "):
+            query = user_input[8:].strip()
+            if not query:
+                print("  Usage: /recall <query>")
+            else:
+                print(f"\n  Assessing recall for: {query!r}...")
+                info = engine.debug_recall(query)
+                _print_recall_debug(info, console, use_rich)
+            continue
+
+        if user_input.lower() == "/sharpen":
+            print("\n  Sharpening blurry memories with web search...")
+            count = engine.sharpen_memories()
+            print(f"  Done. Sharpened {count} memor{'y' if count == 1 else 'ies'}.")
+            continue
+
         if user_input.lower() == "/train":
             print("\nTriggering LoRA training...")
             engine.train_now()
@@ -292,11 +338,14 @@ def run_gradio():
     engine.start_session()
 
     CSS = """
-    .chat-col { display: flex; flex-direction: column; height: calc(100vh - 120px); }
-    .memory-col { display: flex; flex-direction: column; height: calc(100vh - 120px); }
-    .mem-tab-content { overflow-y: auto; max-height: 340px; padding: 4px 0; }
-    .input-row { flex-shrink: 0; margin-top: 8px; }
-    #chatbot { flex: 1; min-height: 0; }
+    body, .gradio-container { height: 100vh; overflow: hidden; }
+    .main-row { height: calc(100vh - 80px) !important; align-items: stretch; }
+    .chat-col { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+    .memory-col { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+    #chatbot { flex: 1 1 auto; min-height: 0; }
+    #chatbot > div { height: 100% !important; }
+    .mem-tab-content { overflow-y: auto; flex: 1 1 auto; min-height: 0; max-height: calc(100vh - 260px); padding: 4px 0; }
+    .input-row { flex-shrink: 0; margin-top: 6px; }
     #send-btn { min-width: 80px; }
     """
 
@@ -398,11 +447,11 @@ def run_gradio():
     with gr.Blocks(title="Living LLM") as demo:
         gr.Markdown("## 🧠 Living LLM — continuously learning language model")
 
-        with gr.Row(equal_height=True):
+        with gr.Row(equal_height=True, elem_classes="main-row"):
             # ── Left: chat panel ──────────────────────────────
             with gr.Column(scale=3, elem_classes="chat-col"):
                 chatbot = gr.Chatbot(
-                    height=480,
+                    height=700,
                     elem_id="chatbot",
                     label="Conversation",
                 )

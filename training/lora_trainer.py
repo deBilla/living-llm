@@ -63,18 +63,30 @@ class LoRATrainer:
         print(f"  Adapter → {adapter_path}")
         print("  (First run will download the MLX model ~4.5 GB if not cached)\n")
 
+        # Write a LoRA config file — newer mlx_lm versions removed --rank
+        # from CLI args and expect it in a config file instead.
+        # Keys must match CONFIG_DEFAULTS in mlx_lm.lora exactly.
+        lora_config = {
+            "lora_parameters": {
+                "rank": config.LORA_RANK,
+                "scale": config.LORA_ALPHA / config.LORA_RANK,
+                "dropout": 0.0,
+            },
+        }
+        config_path = adapter_path / "lora_config.json"
+        config_path.write_text(json.dumps(lora_config, indent=2))
+
         cmd = [
-            sys.executable, "-m", "mlx_lm.lora",
+            sys.executable, "-m", "mlx_lm", "lora",
             "--model", config.MLX_MODEL_ID,
             "--data", training_data_dir,
             "--train",
             "--iters", str(iters),
             "--learning-rate", str(config.LORA_LEARNING_RATE),
-            "--num-layers", str(config.LORA_LORA_LAYERS),
-            "--rank", str(config.LORA_RANK),
             "--adapter-path", str(adapter_path),
             "--batch-size", str(config.LORA_BATCH_SIZE),
             "--grad-checkpoint",  # Trade speed for memory — important on 24GB
+            "-c", str(config_path),
         ]
 
         try:

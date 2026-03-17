@@ -97,11 +97,11 @@ class MemoryRetriever:
 
         if long_term:
             facts = "\n".join(f"  - {m.content}" for m in long_term)
-            sections.append(f"[KNOWN FACTS about this user — use these confidently when asked]\n{facts}")
+            sections.append(f"What I know about this person:\n{facts}")
 
         if mid_term:
             gists = "\n".join(f"  - {m.content}" for m in mid_term)
-            sections.append(f"[STORED FACTS from previous conversations — use these directly, do not say you don't know]\n{gists}")
+            sections.append(f"From previous conversations:\n{gists}")
 
         if web_knowledge:
             # Show confidence and source so the model treats web facts as provisional

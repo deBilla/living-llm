@@ -28,12 +28,14 @@ from llm_backend import LLMBackend, MLXBackend
 from memory.store import MemoryStore, MemoryTier
 from memory.compressor import MemoryCompressor
 from memory.retriever import MemoryRetriever
-from memory.training_data import prepare_training_data, count_new_conversations
+from memory.training_data import prepare_training_data, count_new_conversations, mark_training_complete
 from memory.web_knowledge import WebKnowledgeExtractor
 from training.adapter_manager import AdapterManager
 from training.lora_trainer import LoRATrainer
 from training.eval import AdapterEvaluator
 from tools.react_loop import ReactLoop
+from tools.augmented_recall import AugmentedRecall
+from memory.confidence import MemoryClarity
 
 _TOOL_TAG_RE = re.compile(r"<tool_(?:call|result)>.*?</tool_(?:call|result)>", re.DOTALL)
 
@@ -47,6 +49,9 @@ class ConversationEngine:
         self.web_knowledge = WebKnowledgeExtractor(self.store, self.llm)
         self.messages: list[dict] = []
         self._turn_count = 0
+
+        # Augmented recall — bridges blurry memory and web search
+        self.augmented_recall = AugmentedRecall(self.store, self.llm, self.retriever)
 
         # ReAct loop — session-scoped rate limiting persists across turns
         self.react_loop = ReactLoop(
@@ -90,48 +95,117 @@ class ConversationEngine:
         """
         Process a user message and return the assistant's response.
 
-        With web search enabled:
-          - System prompt includes TOOL_USE_PROMPT so the model knows its tools
-          - Response goes through the ReAct loop
-          - If searches were made, facts are extracted and stored in WEB tier
+        Pipeline:
+        1. Augmented recall — classify memory as CLEAR / BLURRY / ABSENT
+        2. If BLURRY, use memory as seed to search the web and merge results
+        3. If ABSENT and searchable, search fresh
+        4. Build prompt with memory + web context
+        5. Run the ReAct loop for any additional tool calls
+        6. Store exchange; extract web knowledge if searches happened
+        7. Check user feedback on previous augmented recall
         """
         self._turn_count += 1
 
         if self._pending_adapter:
             self._activate_pending_adapter()
 
-        # Build system prompt: base + tool instructions + memory context
-        memory_context = self.retriever.build_memory_prompt(user_input)
+        # Check if previous turn's augmented recall got user feedback
+        if config.WEB_SEARCH_ENABLED:
+            self.augmented_recall.check_user_feedback(user_input)
+
+        # Step 1: Augmented recall — memory retrieval + optional web search
+        if config.WEB_SEARCH_ENABLED:
+            recall_result = self.augmented_recall.recall_and_augment(user_input)
+        else:
+            recall_result = {
+                "clarity": "clear",
+                "memory_context": self.retriever.build_memory_prompt(user_input),
+                "web_context": None,
+                "search_performed": False,
+                "memory_updated": False,
+                "search_log": [],
+            }
+
+        # Step 2: Build system prompt
         system_content = config.SYSTEM_PROMPT
         if config.WEB_SEARCH_ENABLED:
             system_content += "\n\n" + config.TOOL_USE_PROMPT
-        if memory_context:
-            system_content += "\n\n" + memory_context
 
+        if recall_result["memory_context"]:
+            system_content += "\n\n" + recall_result["memory_context"]
+            print(f"  [Context] Memory context injected ({len(recall_result['memory_context'])} chars)")
+
+        if recall_result["web_context"]:
+            system_content += (
+                "\n\n<web_search_results>\n"
+                + recall_result["web_context"]
+                + "\n</web_search_results>"
+            )
+            print(f"  [Context] Web context injected ({len(recall_result['web_context'])} chars)")
+
+        # Add clarity hint so the model knows how to frame its response
+        if recall_result["clarity"] == "blurry":
+            system_content += (
+                "\n\nNOTE: Some of the context above came from augmenting blurry memories "
+                "with web search. When referencing this information, clearly distinguish "
+                "what you remembered vs what you just looked up. Example: 'I remembered "
+                "you mentioned something about X, and I looked it up to get the details...'"
+            )
+        elif recall_result["clarity"] == "absent" and recall_result["search_performed"]:
+            system_content += (
+                "\n\nNOTE: You had no memory of this topic, so the context above is from "
+                "a fresh web search. Be transparent: 'I don't have any previous knowledge "
+                "about this, but I searched and found...'"
+            )
+
+        # Step 3: Build messages
         messages = [{"role": "system", "content": system_content}]
         messages.extend(self.messages[-(6 * 2):])  # Last 6 turns
-        messages.append({"role": "user", "content": user_input})
+
+        # Inject memory summary directly into the user message so the 8B model
+        # can't miss it. Small models pay far more attention to user turns than
+        # system content buried early in the context window.
+        user_msg = user_input
+        has_context = recall_result["memory_context"] or recall_result["web_context"]
+        if has_context:
+            context_parts = []
+            if recall_result["memory_context"]:
+                context_parts.append(recall_result["memory_context"])
+            if recall_result["web_context"]:
+                context_parts.append(
+                    "<web_search_results>\n"
+                    + recall_result["web_context"]
+                    + "\n</web_search_results>"
+                )
+            injected = "\n\n".join(context_parts)
+            user_msg = (
+                f"Here is what you remember about me from past conversations "
+                f"(use this naturally, do NOT mention section names or tags):\n\n"
+                f"{injected}\n\n"
+                f"Now answer this: {user_input}"
+            )
+
+        messages.append({"role": "user", "content": user_msg})
 
         backend = self._active_backend()
 
-        if config.WEB_SEARCH_ENABLED:
-            response, search_log = self.react_loop.run(backend, messages)
+        # Step 4: Run ReAct loop (may do additional searches beyond augmented recall)
+        search_log = list(recall_result.get("search_log", []))
 
-            # Warn about any URLs in the response that weren't from search results
+        if config.WEB_SEARCH_ENABLED:
+            response, react_log = self.react_loop.run(backend, messages)
+            search_log.extend(react_log)
+
             bad_urls = self.react_loop.verify_citations(response, search_log)
             if bad_urls:
                 print(f"  [Warning: response mentions unverified URLs: {bad_urls}]")
-
-            # Store web knowledge from this turn
-            if search_log:
-                self.web_knowledge.extract_and_store(user_input, search_log, response)
         else:
             response = backend.chat(messages)
-            search_log = []
 
         # Clean up any stray tool tags that slipped through
         response = _TOOL_TAG_RE.sub("", response).strip()
 
+        # Step 5: Store exchange
         self.messages.append({"role": "user", "content": user_input})
         self.messages.append({"role": "assistant", "content": response})
 
@@ -140,6 +214,15 @@ class ConversationEngine:
             tier=MemoryTier.SHORT,
             metadata={"turn": self._turn_count, "type": "user_message"},
         )
+
+        # Step 6: Extract web knowledge from any searches
+        if search_log:
+            self.web_knowledge.extract_and_store(user_input, search_log, response)
+
+        # Step 7: Log recall outcome
+        if recall_result["search_performed"]:
+            updated = "updated" if recall_result["memory_updated"] else "unchanged"
+            print(f"  [Recall] {recall_result['clarity']} -> searched web -> memory {updated}")
 
         return response
 
@@ -253,6 +336,10 @@ class ConversationEngine:
             print("  No new conversations to train on.")
             print("  (Need compressed conversations — have a few chats and run /quit first)")
             return False
+        if new_convos < config.LORA_MIN_CONVERSATIONS:
+            print(f"  Need at least {config.LORA_MIN_CONVERSATIONS} conversations, have {new_convos}.")
+            print("  Have more chats, /quit to compress, then try again.")
+            return False
         print(f"  Starting training on {new_convos} conversation(s)...")
         return self._start_training_background()
 
@@ -295,6 +382,53 @@ class ConversationEngine:
         status["mlx_available"] = MLXBackend.is_available()
         status.update(self.evaluator.get_summary())
         return status
+
+    # ── Augmented recall commands ─────────────────────────────
+
+    def debug_recall(self, query: str) -> dict:
+        """Run augmented recall and return the full assessment (for /recall)."""
+        recall_result = self.augmented_recall.recall_and_augment(query)
+        assessment = recall_result.get("assessment")
+        return {
+            "clarity": recall_result["clarity"],
+            "confidence": assessment.confidence if assessment else 0.0,
+            "missing_details": assessment.missing_details if assessment else [],
+            "suggested_search": assessment.suggested_search if assessment else None,
+            "memories_found": len(assessment.memories) if assessment else 0,
+            "memory_texts": [m.content for m in (assessment.memories if assessment else [])],
+            "search_performed": recall_result["search_performed"],
+            "memory_updated": recall_result["memory_updated"],
+            "web_context": recall_result.get("web_context"),
+        }
+
+    def sharpen_memories(self) -> int:
+        """
+        Proactively enrich blurry memories with web search.
+        Like reviewing and updating old notes.
+        """
+        all_memories = (
+            self.store.get_memories_by_tier(MemoryTier.MID)
+            + self.store.get_memories_by_tier(MemoryTier.LONG)
+        )
+
+        sharpened = 0
+        for memory in all_memories:
+            if memory.session_count < 3 and memory.relevance_score > 0.7:
+                continue
+
+            assessment = self.augmented_recall.classifier.assess(
+                memory.content, [memory]
+            )
+
+            if assessment.clarity == MemoryClarity.BLURRY and assessment.suggested_search:
+                result = self.augmented_recall._augment_blurry_memory(
+                    memory.content, assessment
+                )
+                if result and result["memory_updated"]:
+                    sharpened += 1
+                    print(f"  Sharpened: {memory.content[:60]}...")
+
+        return sharpened
 
     # ── Memory debug ───────────────────────────────────────────
 
@@ -344,6 +478,8 @@ class ConversationEngine:
         def _on_done(adapter_path: str | None):
             self._training_active = False
             if adapter_path:
+                # Only now mark conversations as used — failed training shouldn't consume them
+                mark_training_complete(training_dir)
                 self.adapter_manager.on_training_complete(adapter_path)
                 self._pending_adapter = adapter_path
                 self.evaluator.log_training_event(

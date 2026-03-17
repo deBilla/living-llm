@@ -188,9 +188,20 @@ def prepare_training_data(store) -> Optional[str]:
     }
     (training_dir / f"batch_{timestamp}.json").write_text(json.dumps(batch_meta, indent=2))
 
-    _mark_conversations_used(used_conv_ids)
+    # Don't mark as used yet — wait until training actually succeeds.
+    # Save the IDs so the caller can mark them after success.
+    (training_dir / "pending_ids.json").write_text(json.dumps(used_conv_ids))
 
     return str(training_dir)
+
+
+def mark_training_complete(training_data_dir: str):
+    """Mark pending conversations as used. Call only after training succeeds."""
+    pending_file = Path(training_data_dir) / "pending_ids.json"
+    if pending_file.exists():
+        conv_ids = json.loads(pending_file.read_text())
+        _mark_conversations_used(conv_ids)
+        pending_file.unlink()
 
 
 def get_training_stats() -> dict:

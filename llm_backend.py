@@ -184,6 +184,7 @@ class MLXBackend:
             self.load()
 
         from mlx_lm import generate
+        from mlx_lm.sample_utils import make_sampler
 
         # Use the tokenizer's built-in chat template if available
         try:
@@ -195,14 +196,25 @@ class MLXBackend:
         except Exception:
             prompt = self._format_llama3(messages)
 
+        temp = temperature if temperature is not None else config.TEMPERATURE
+        sampler = make_sampler(temp=temp)
+
         response = generate(
             self._model,
             self._tokenizer,
             prompt=prompt,
             max_tokens=max_tokens or config.MAX_TOKENS,
-            temp=temperature if temperature is not None else config.TEMPERATURE,
+            sampler=sampler,
             verbose=False,
         )
+
+        # Strip leaked Llama 3.1 template tokens — the model sometimes generates
+        # past EOS into the next turn's header, especially with LoRA adapters.
+        for stop in ("<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>",
+                      "<|end_of_turn|>", "<|begin_of_text|>"):
+            if stop in response:
+                response = response[:response.index(stop)]
+
         return response.strip()
 
     def is_loaded(self) -> bool:

@@ -78,6 +78,9 @@ class ReactLoop:
 
             tool_call_jsons = _TOOL_CALL_RE.findall(response)
 
+            if tool_call_jsons:
+                print(f"  [ReAct] Iteration {iteration + 1}: {len(tool_call_jsons)} tool call(s) found")
+
             if not tool_call_jsons:
                 # No tool calls — model has produced its final answer
                 return _strip_tool_tags(response), search_log
@@ -123,8 +126,75 @@ class ReactLoop:
                 return _tool_result("read_page requires a 'url' field")
             return self._do_read(url, search_log)
 
+        elif tool == "datetime":
+            return self._do_datetime()
+
+        elif tool == "python":
+            code = call.get("code", "").strip()
+            if not code:
+                return _tool_result("python requires a 'code' field")
+            return self._do_python(code)
+
+        elif tool == "read_file":
+            path = call.get("path", "").strip()
+            if not path:
+                return _tool_result("read_file requires a 'path' field")
+            return self._do_read_file(path)
+
+        elif tool == "write_file":
+            path = call.get("path", "").strip()
+            content = call.get("content", "")
+            if not path:
+                return _tool_result("write_file requires a 'path' field")
+            return self._do_write_file(path, content)
+
+        elif tool == "list_files":
+            path = call.get("path", ".")
+            return self._do_list_files(path)
+
+        elif tool == "shell":
+            command = call.get("command", "").strip()
+            if not command:
+                return _tool_result("shell requires a 'command' field")
+            return self._do_shell(command)
+
+        elif tool == "weather":
+            location = call.get("location", "").strip()
+            if not location:
+                return _tool_result("weather requires a 'location' field")
+            return self._do_weather(location)
+
+        elif tool == "wikipedia":
+            query = call.get("query", "").strip()
+            if not query:
+                return _tool_result("wikipedia requires a 'query' field")
+            return self._do_wikipedia(query)
+
+        elif tool == "notify":
+            title = call.get("title", "Living LLM")
+            message = call.get("message", "").strip()
+            if not message:
+                return _tool_result("notify requires a 'message' field")
+            return self._do_notify(title, message)
+
+        elif tool == "http_get":
+            url = call.get("url", "").strip()
+            if not url:
+                return _tool_result("http_get requires a 'url' field")
+            return self._do_http("GET", url, call.get("headers"))
+
+        elif tool == "http_post":
+            url = call.get("url", "").strip()
+            if not url:
+                return _tool_result("http_post requires a 'url' field")
+            return self._do_http("POST", url, call.get("headers"), call.get("body"))
+
         else:
-            return _tool_result(f"Unknown tool: {tool!r}. Available: web_search, read_page")
+            available = (
+                "web_search, read_page, datetime, python, read_file, write_file, "
+                "list_files, shell, weather, wikipedia, notify, http_get, http_post"
+            )
+            return _tool_result(f"Unknown tool: {tool!r}. Available: {available}")
 
     def _do_search(self, query: str, search_log: list[dict]) -> str:
         # Session cap
@@ -178,6 +248,101 @@ class ReactLoop:
 
         title = f"\nTitle: {result['title']}\n" if result["title"] else ""
         return _tool_result(f"Content from {url}:{title}\n\n{result['content']}")
+
+    # ── New tools ──────────────────────────────────────────────
+
+    def _do_datetime(self) -> str:
+        from tools.datetime_tool import now
+        result = now()
+        return _tool_result(
+            f"Current time: {result['local_time']} ({result['timezone']})\n"
+            f"Day: {result['day_of_week']}\n"
+            f"UTC: {result['utc_time']}"
+        )
+
+    def _do_python(self, code: str) -> str:
+        from tools.python_exec import run_code
+        print(f"  [Tool] python: {code[:80]}...")
+        result = run_code(code)
+        if result["error"]:
+            return _tool_result(f"Python error: {result['error']}")
+        output = result["output"] or "(no output)"
+        return _tool_result(f"Python output:\n{output}")
+
+    def _do_read_file(self, path: str) -> str:
+        from tools.file_tools import read_file
+        result = read_file(path)
+        if result["error"]:
+            return _tool_result(f"File error: {result['error']}")
+        return _tool_result(f"File: {result['path']}\n\n{result['content']}")
+
+    def _do_write_file(self, path: str, content: str) -> str:
+        from tools.file_tools import write_file
+        result = write_file(path, content)
+        if result["error"]:
+            return _tool_result(f"Write error: {result['error']}")
+        return _tool_result(f"Written {result['bytes_written']} bytes to {result['path']}")
+
+    def _do_list_files(self, path: str) -> str:
+        from tools.file_tools import list_files
+        result = list_files(path)
+        if result["error"]:
+            return _tool_result(f"List error: {result['error']}")
+        entries = "\n".join(result["files"]) if result["files"] else "(empty)"
+        return _tool_result(f"Directory: {result['path']}\n{entries}")
+
+    def _do_shell(self, command: str) -> str:
+        from tools.shell_exec import run_shell
+        print(f"  [Tool] shell: {command}")
+        result = run_shell(command)
+        if result["error"]:
+            return _tool_result(f"Shell error: {result['error']}")
+        output = result["output"] or "(no output)"
+        return _tool_result(f"$ {command}\n{output}\n(exit code: {result['exit_code']})")
+
+    def _do_weather(self, location: str) -> str:
+        from tools.weather import get_weather
+        result = get_weather(location)
+        if result["error"]:
+            return _tool_result(f"Weather error: {result['error']}")
+        return _tool_result(
+            f"Weather for {result['location']}:\n"
+            f"  Temperature: {result['temperature_c']}°C / {result['temperature_f']}°F\n"
+            f"  Conditions: {result['conditions']}\n"
+            f"  Humidity: {result['humidity']}%\n"
+            f"  Wind: {result['wind_speed_kmh']} km/h"
+        )
+
+    def _do_wikipedia(self, query: str) -> str:
+        from tools.wikipedia import search_wikipedia
+        result = search_wikipedia(query)
+        if result["error"]:
+            return _tool_result(f"Wikipedia error: {result['error']}")
+        if not result["results"]:
+            return _tool_result(f"No Wikipedia articles found for: {query}")
+        parts = []
+        for r in result["results"]:
+            parts.append(f"**{r['title']}** ({r['url']})\n{r['summary']}")
+        return _tool_result("\n\n".join(parts))
+
+    def _do_notify(self, title: str, message: str) -> str:
+        from tools.notify import send_notification
+        result = send_notification(title, message)
+        if result["error"]:
+            return _tool_result(f"Notification error: {result['error']}")
+        return _tool_result(f"Notification sent: {title} — {message}")
+
+    def _do_http(self, method: str, url: str, headers: dict = None, body: dict = None) -> str:
+        from tools.http_request import http_get, http_post
+        if method == "POST":
+            result = http_post(url, body=body, headers=headers)
+        else:
+            result = http_get(url, headers=headers)
+        if result["error"]:
+            return _tool_result(f"HTTP error: {result['error']}")
+        return _tool_result(
+            f"HTTP {method} {url} → {result['status']}\n{result['body']}"
+        )
 
     # ── Citation verification ─────────────────────────────────
 

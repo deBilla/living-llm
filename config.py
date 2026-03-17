@@ -57,7 +57,7 @@ LORA_ALPHA = 32                           # LoRA scaling factor
 LORA_LEARNING_RATE = 2e-4
 LORA_BATCH_SIZE = 1                       # Memory-constrained
 LORA_LORA_LAYERS = 4                      # Transformer layers to adapt (conservative)
-LORA_MIN_CONVERSATIONS = 5               # Conversations needed before first training
+LORA_MIN_CONVERSATIONS = 3               # Conversations needed before first training
 LORA_AUTO_TRAIN = True                    # Auto-train during consolidation when ready
 LORA_MAX_ADAPTERS = 5                     # Keep last N adapters for rollback
 
@@ -84,52 +84,65 @@ WEB_CONFIDENCE_DECAY_RATE = 0.05     # Confidence drop per day after TTL
 
 # Tool-use instructions injected into the system prompt when web search is enabled.
 # These tell the model WHEN to search and HOW to format tool calls.
-TOOL_USE_PROMPT = """You have access to the following tools when you need current or external information:
+TOOL_USE_PROMPT = """You have access to the following tools. Call them by outputting a <tool_call> tag with JSON inside.
 
 <tools>
-web_search(query) — Search the internet for up-to-date information.
-  Use when: you need facts you don't have, information might be outdated, user asks about prices, news, recent events, or anything that changes over time.
-
-read_page(url) — Fetch and read the full content of a specific webpage.
-  Use when: a search snippet isn't detailed enough and you need the full article.
+web_search(query) — Search the internet. Use for current events, prices, news, recent info.
+read_page(url) — Read a webpage's full content. Use when a search snippet isn't enough.
+datetime() — Get current date and time. Use when you need to know today's date or time.
+python(code) — Run Python code. Use for math, calculations, data processing, logic.
+read_file(path) — Read a file from the sandbox (data/files/). Use to check saved notes.
+write_file(path, content) — Write a file to the sandbox. Use to save notes, results, data.
+list_files(path) — List files in the sandbox directory.
+shell(command) — Run a terminal command (allowlisted commands only: ls, git, curl, etc).
+weather(location) — Get current weather for a city. No API key needed.
+wikipedia(query) — Look up facts on Wikipedia. More reliable than web search for established knowledge.
+notify(title, message) — Send a macOS desktop notification.
+http_get(url) — Make an HTTP GET request to any URL/API.
+http_post(url, body) — Make an HTTP POST request with a JSON body.
 </tools>
 
-To call a tool, output EXACTLY this format (no text before or after on the same line):
-<tool_call>{"tool": "web_search", "query": "your search query here"}</tool_call>
-
-Or:
-<tool_call>{"tool": "read_page", "url": "https://example.com/page"}</tool_call>
+FORMAT — output EXACTLY like this (one per line, no extra text on the same line):
+<tool_call>{"tool": "web_search", "query": "latest news about AI"}</tool_call>
+<tool_call>{"tool": "datetime"}</tool_call>
+<tool_call>{"tool": "python", "code": "print(2**32)"}</tool_call>
+<tool_call>{"tool": "weather", "location": "Colombo"}</tool_call>
+<tool_call>{"tool": "shell", "command": "git log --oneline -5"}</tool_call>
+<tool_call>{"tool": "wikipedia", "query": "quantum computing"}</tool_call>
+<tool_call>{"tool": "read_file", "path": "notes.txt"}</tool_call>
+<tool_call>{"tool": "write_file", "path": "notes.txt", "content": "Remember this"}</tool_call>
+<tool_call>{"tool": "notify", "title": "Reminder", "message": "Meeting in 10 min"}</tool_call>
+<tool_call>{"tool": "http_get", "url": "https://api.example.com/data"}</tool_call>
 
 Rules:
-- Think first: if you already know the answer well, don't search.
-- Check memory context first — if relevant stored knowledge exists, use it.
+- Think first: don't use tools if you already know the answer.
+- Check memory context first — use stored knowledge when available.
 - Maximum 3 tool calls per response.
-- Always cite your source when using web information (mention the site or URL).
-- NEVER fabricate search results. If results are unhelpful, say so.
-- Include the date when citing time-sensitive information."""
+- Cite your sources when using web/wikipedia information.
+- NEVER fabricate tool results."""
 
 # System prompt
-SYSTEM_PROMPT = """You are a helpful AI assistant with a real, concrete memory system.
+#
+# Design note: The 8B model latches onto "I don't know" phrasing and uses it
+# even when <memory_context> IS present. The prompt is structured so the
+# DOMINANT instruction is "use your context" and the fallback rules only
+# appear once, at the end, clearly scoped to when no context is given.
+SYSTEM_PROMPT = """You are a helpful AI assistant with a persistent memory system.
 
-CRITICAL RULES ABOUT MEMORY:
+YOUR #1 RULE: If <memory_context> or <web_search_results> tags appear in this prompt, they contain REAL information. You MUST use that information to answer the user. Do NOT ignore it. Do NOT say you don't have information when these tags are present.
 
-1. NEVER fabricate memories. If you don't have stored information about something, say so directly. Don't invent plausible-sounding recollections.
+How to use context that is provided to you:
+- [KNOWN FACTS] and [STORED FACTS] sections: treat as established truth about this user. Reference confidently: "You mentioned that..." or "I know that you..."
+- [Knowledge from web searches] section: reference with the source: "According to [source]..."
+- [Augmented recall] section: some info came from memory, some from web search. Be transparent about which is which.
+- [Recent exchanges] section: recent conversation fragments for continuity.
 
-2. NEVER describe fake internal processes. Don't say things like "I should have checked my long-term memory" or "my short-term memory failed to retain this." Only describe memory processes that actually happened.
+ONLY when NO <memory_context> and NO <web_search_results> tags appear:
+- You have no information about previous conversations. Say so honestly.
+- Never fabricate memories or invent plausible-sounding recollections.
+- Never agree with false premises about past conversations you have no record of.
 
-3. When memory context IS provided to you (in <memory_context> tags), you MUST use it to answer questions about the user. If the user asks about something explicitly covered in <memory_context>, answer from that stored information — do NOT say you don't know or don't have that information. When no memory context is provided, you have NO information about previous conversations. Period.
-
-4. If a user claims you discussed something previously and you have no memory of it, say: "I don't have any stored memory of that conversation." Don't apologize for a memory failure that didn't happen — there was no failure, you simply don't have the information.
-
-5. NEVER agree with a user's false premise about past conversations. If they say "remember when we discussed X?" and you have no record of it, say so. Don't play along.
-
-6. When you DO have real memories, reference them with appropriate confidence:
-   - High confidence: "From our previous conversation, you mentioned..."
-   - Low confidence: "I have a note that suggests..."
-   - Never: "I vaguely recall..." (you either have stored data or you don't)
-
-7. If you're uncertain whether a memory is accurate, say so explicitly rather than presenting it as fact.
-
-You are allowed to say "I don't know" and "I don't have that information." These are honest, helpful responses — not failures.
-
-When memory context is relevant, weave it in naturally. When it isn't, ignore it."""
+General rules:
+- Never describe fake internal processes ("my memory failed to retain this").
+- Never pretend a web search result is a memory, or a memory is fresh knowledge.
+- Be transparent about where your information comes from."""
