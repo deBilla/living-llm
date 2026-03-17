@@ -105,9 +105,16 @@ def _mark_conversations_used(conv_ids: list[str]):
 
 
 def count_new_conversations(store) -> int:
-    """Return how many compressed conversations haven't been used for training yet."""
+    """Return how many compressed conversations haven't been used for training yet.
+
+    Accepts either the old MemoryStore (with .conn) or limbiq's MemoryStore (with .db).
+    """
     used_ids = _get_used_conversation_ids()
-    rows = store.conn.execute(
+    # Support both old store (.conn) and limbiq store (.db)
+    conn = getattr(store, 'conn', None) or getattr(store, 'db', None)
+    if conn is None:
+        return 0
+    rows = conn.execute(
         "SELECT id FROM conversations WHERE compressed = 1"
     ).fetchall()
     return sum(1 for (row_id,) in rows if row_id not in used_ids)
@@ -130,7 +137,11 @@ def prepare_training_data(store) -> Optional[str]:
 
     used_ids = _get_used_conversation_ids()
 
-    rows = store.conn.execute(
+    # Support both old store (.conn) and limbiq store (.db)
+    conn = getattr(store, 'conn', None) or getattr(store, 'db', None)
+    if conn is None:
+        return None
+    rows = conn.execute(
         "SELECT id, messages FROM conversations WHERE compressed = 1 ORDER BY created_at ASC"
     ).fetchall()
 

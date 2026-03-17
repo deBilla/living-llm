@@ -1,72 +1,84 @@
 """
-Consolidation Daemon — the "sleep cycle".
+Consolidation — simplified for limbiq.
 
-Can be run standalone to process accumulated memories in the background.
-This is separate from the main chat loop so it can run on a schedule.
+Limbiq handles memory compression and cleanup via lq.end_session().
+This script wraps that for standalone/scheduled usage, and optionally
+triggers LoRA training.
 
 Usage:
     python consolidate.py              # Run once
-    python consolidate.py --watch      # Run continuously every N minutes
-    python consolidate.py --stats      # Just show memory stats
-    python consolidate.py --train      # Run consolidation then trigger LoRA training
+    python consolidate.py --stats      # Show memory stats only
+    python consolidate.py --train      # Consolidate + trigger LoRA training
 """
 
 import time
 import argparse
 
+from limbiq import Limbiq
 from llm_backend import LLMBackend
-from memory.store import MemoryStore
-from memory.compressor import MemoryCompressor
 from memory.training_data import prepare_training_data, count_new_conversations
 from training.adapter_manager import AdapterManager
 from training.lora_trainer import LoRATrainer
 import config
 
 
+def _make_llm_fn(llm: LLMBackend):
+    """Create the compression adapter function for limbiq."""
+    def compress_fn(prompt: str) -> str:
+        return llm.chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.2,
+        )
+    return compress_fn
+
+
 def run_consolidation(verbose: bool = True, train: bool = False):
     """
-    Run a single consolidation cycle.
+    Run a single consolidation cycle via limbiq.
 
-    If train=True (or LORA_AUTO_TRAIN is set and enough data exists),
-    kick off LoRA training after compression. Training runs synchronously
-    when called from the CLI — the daemon waits for it to complete.
+    If train=True, kick off LoRA training after consolidation.
     """
     if verbose:
         print("Initializing consolidation...")
 
-    store = MemoryStore()
     llm = LLMBackend()
-    compressor = MemoryCompressor(store, llm)
+    lq = Limbiq(
+        store_path=config.LIMBIQ_STORE_PATH,
+        user_id=config.USER_ID,
+        embedding_model=config.EMBEDDING_MODEL,
+        llm_fn=_make_llm_fn(llm),
+    )
 
     if verbose:
-        stats = store.get_stats()
-        print(f"Before: {stats['short']} short / {stats['mid']} mid / {stats['long']} long-term")
+        stats = lq.get_stats()
+        print(f"Before: {stats}")
 
-    results = compressor.run_full_cycle()
+    results = lq.end_session()
 
     if verbose:
         print(f"\nResults:")
-        print(f"  Conversations compressed: {results['conversations_compressed']}")
-        print(f"  Memories expired: {results['memories_expired']}")
-        print(f"  Long-term consolidated: {results['long_term_consolidated']}")
+        print(f"  Compressed: {results.get('compressed', 0)} facts")
+        print(f"  Suppressed: {results.get('suppressed', 0)} stale memories")
+        print(f"  Deleted: {results.get('deleted', 0)} old suppressed")
 
-        stats = store.get_stats()
-        print(f"\nAfter: {stats['short']} short / {stats['mid']} mid / {stats['long']} long-term")
+        stats = lq.get_stats()
+        print(f"\nAfter: {stats}")
 
     # LoRA training step
     should_train = train or config.LORA_AUTO_TRAIN
     if should_train and config.LORA_ENABLED:
-        new_convos = count_new_conversations(store)
+        new_convos = count_new_conversations(lq._core.store)
         adapter_manager = AdapterManager()
         if adapter_manager.should_auto_train(new_convos):
             if verbose:
                 print(f"\n  {new_convos} new conversation(s) ready for LoRA training...")
-            training_dir = prepare_training_data(store)
+            training_dir = prepare_training_data(lq._core.store)
             if training_dir:
                 trainer = LoRATrainer()
                 if not trainer.is_available():
                     if verbose:
-                        print("  mlx_lm not installed — skipping training. Run: pip install mlx-lm")
+                        print("  mlx_lm not installed — skipping training.")
                 else:
                     adapter_path = trainer.train(training_dir, num_conversations=new_convos)
                     if adapter_path:
@@ -78,67 +90,46 @@ def run_consolidation(verbose: bool = True, train: bool = False):
                 print(f"  Not enough quality data yet (need {config.LORA_MIN_CONVERSATIONS} conversations)")
         elif verbose and config.LORA_AUTO_TRAIN:
             remaining = config.LORA_MIN_CONVERSATIONS - new_convos
-            print(f"\n  LoRA: {new_convos}/{config.LORA_MIN_CONVERSATIONS} conversations — need {remaining} more to train")
+            print(f"\n  LoRA: {new_convos}/{config.LORA_MIN_CONVERSATIONS} conversations — need {remaining} more")
 
     return results
 
 
 def show_stats():
     """Display current memory statistics."""
-    store = MemoryStore()
-    stats = store.get_stats()
+    lq = Limbiq(
+        store_path=config.LIMBIQ_STORE_PATH,
+        user_id=config.USER_ID,
+    )
 
+    stats = lq.get_stats()
     print(f"\n{'=' * 40}")
-    print(f"  Living LLM — Memory Statistics")
+    print(f"  Living LLM — Memory Statistics (Limbiq)")
     print(f"{'=' * 40}")
-    print(f"  Short-term memories:  {stats['short']}")
-    print(f"  Mid-term gists:       {stats['mid']}")
-    print(f"  Long-term facts:      {stats['long']}")
-    print(f"  Stored conversations: {stats['conversations']}")
+    for key, val in stats.items():
+        print(f"  {key}: {val}")
     print(f"{'=' * 40}")
 
-    # Show long-term knowledge
-    from memory.store import MemoryTier
-    long_memories = store.get_memories_by_tier(MemoryTier.LONG)
-    if long_memories:
-        print(f"\n  Long-term knowledge:")
-        for m in long_memories:
+    priority = lq.get_priority_memories()
+    if priority:
+        print(f"\n  Priority memories (Dopamine-tagged):")
+        for m in priority:
             print(f"    {m.content[:200]}")
 
-    mid_memories = store.get_memories_by_tier(MemoryTier.MID)
-    if mid_memories:
-        print(f"\n  Recent gists ({len(mid_memories)}):")
-        for m in mid_memories[:5]:
-            print(f"    {m.content[:200]}")
+    suppressed = lq.get_suppressed()
+    if suppressed:
+        print(f"\n  Suppressed memories: {len(suppressed)}")
+
     print()
 
 
-def watch_mode():
-    """Run consolidation on a loop."""
-    interval = config.CONSOLIDATE_INTERVAL_MINS * 60
-    print(f"Watching for new memories every {config.CONSOLIDATE_INTERVAL_MINS} minutes...")
-    print("Press Ctrl+C to stop.\n")
-
-    while True:
-        try:
-            run_consolidation(verbose=True)
-            print(f"\nSleeping {config.CONSOLIDATE_INTERVAL_MINS} minutes...\n")
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Memory consolidation daemon")
-    parser.add_argument("--watch", action="store_true", help="Run continuously")
+    parser = argparse.ArgumentParser(description="Memory consolidation (limbiq)")
     parser.add_argument("--stats", action="store_true", help="Show memory stats only")
-    parser.add_argument("--train", action="store_true", help="Run consolidation then LoRA training")
+    parser.add_argument("--train", action="store_true", help="Consolidate + LoRA training")
     args = parser.parse_args()
 
     if args.stats:
         show_stats()
-    elif args.watch:
-        watch_mode()
     else:
         run_consolidation(train=args.train)

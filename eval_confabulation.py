@@ -247,10 +247,14 @@ def _make_engine(disable_memory: bool = False, disable_adapter: bool = False):
     engine = ConversationEngine()
 
     if disable_memory:
-        # Patch the retriever in-place — no subclassing needed.
-        # This keeps ALL other engine behavior intact (storage, TTLs, etc.)
+        # Patch limbiq's process to return empty context — no memory injection.
+        # This keeps ALL other engine behavior intact (storage, etc.)
         # so the only difference from the "memory" phase is the context injection.
-        engine.retriever.build_memory_prompt = lambda _query: ""
+        from limbiq.types import ProcessResult
+        engine.lq.process = lambda message, conversation_history=None: ProcessResult(
+            context="", signals_fired=[], memories_retrieved=0,
+            priority_count=0, suppressed_count=0,
+        )
 
     if disable_adapter:
         engine.adapter_off()

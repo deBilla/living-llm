@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Base dependencies (macOS/Apple Silicon)
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/metal
-pip install sentence-transformers chromadb rich gradio huggingface-hub
+pip install limbiq rich gradio huggingface-hub
 
 # LoRA training (Apple Silicon — pulls mlx as dependency)
 pip install mlx-lm
@@ -26,42 +26,39 @@ On first `/train`, mlx-lm downloads `mlx-community/Meta-Llama-3.1-8B-Instruct-4b
 python main.py          # Terminal chat
 python main.py --ui     # Gradio web UI
 python consolidate.py   # Single consolidation cycle
-python consolidate.py --watch  # Background consolidation loop
 python consolidate.py --stats  # Memory stats
 python consolidate.py --train  # Consolidate + trigger LoRA training
 ```
 
-**In-chat commands:** `/memory`, `/search <query>`, `/recall <query>`, `/sharpen`, `/knowledge`, `/knowledge clear`, `/knowledge decay`, `/new`, `/quit`, `/train`, `/adapter`, `/adapter compare`, `/adapter off`, `/adapter on`
+**In-chat commands:** `/memory`, `/signals`, `/priority`, `/suppress`, `/dopamine <fact>`, `/gaba <id>`, `/correct <info>`, `/good`, `/bad`, `/restore <id>`, `/search <query>`, `/export`, `/new`, `/quit`, `/train`, `/adapter`, `/adapter compare`, `/adapter off`, `/adapter on`
 
 ## Architecture
 
-**Inference pipeline (`engine.py` → `respond()`):**
-1. User input → augmented recall classifies memory as CLEAR / BLURRY / ABSENT
-2. BLURRY: memory seeds a targeted web search, LLM merges memory + web results
-3. ABSENT + searchable: fresh web search
-4. Memory context injected into **user message** (not system prompt) — 8B models ignore system prompt content but attend to user turns
-5. ReAct loop runs: model can call tools via `<tool_call>` XML tags, loop intercepts and executes, feeds results back (max 3 iterations)
-6. Exchange stored in short-term memory; web knowledge extracted if searches happened
+Living LLM is a **thin demo application** for [limbiq](https://github.com/deBilla/limbiq). All memory, learning, and adaptation logic lives in the limbiq library. The app provides:
+- A chat interface (Gradio / terminal)
+- An LLM backend (llama.cpp + optional MLX for LoRA)
+- A web search module
+- Wiring that connects them through limbiq's 3-method API: `process -> LLM -> observe`
 
-**Key design decision — memory injection location:** Context is injected into the user message as `"Here is what you remember about me... Now answer this: {user_input}"`. This forces the 8B model to use stored memories. Section headers use natural language (not tags like `[KNOWN FACTS]`) to prevent the model from leaking formatting into responses.
+**Core loop (`engine.py` -> `respond()`):**
+1. `lq.process(message)` -> limbiq returns enriched memory context
+2. Optionally augment with web search if limbiq found few memories
+3. Build prompt: system + memory context + web context + user message
+4. Memory context injected into **user message** (not just system prompt) — 8B models ignore system prompt content but attend to user turns
+5. ReAct loop runs tool calls (web_search, python, weather, etc.)
+6. `lq.observe(message, response)` -> limbiq fires signals and stores exchange
+7. On session end: `lq.end_session()` -> compression + stale memory suppression
 
-**Augmented recall (`tools/augmented_recall.py` + `memory/confidence.py`):**
-- `MemoryConfidenceClassifier` uses a fast heuristic path (score > 0.6 → CLEAR, score < 0.2 → ABSENT) with LLM evaluation for borderline cases
-- BLURRY memories are used as search seeds for targeted web queries, then LLM merges memory + web results with `[memory]`/`[web]`/`[corrected]` tags
-- User feedback (confirmation/denial) adjusts memory confidence scores
+**Limbiq signals:**
+- **Dopamine** — "This matters, remember it." Fires on personal info, corrections, positive feedback. Tagged memories always surface in context.
+- **GABA** — "Suppress this, let it fade." Fires on denials, contradictions, stale memories. Suppression is soft and reversible.
 
-**Consolidation pipeline (`consolidate.py` / `memory/compressor.py`):**
-- Full conversations → **atomic facts** via `extract_atomic_facts()` (one fact per MID memory entry for better embedding search)
-- 3+ facts → abstract **long-term facts** (permanent)
-- Details fade, meaning persists — lossy like human memory
+**Key design decision — memory injection location:** Context is injected into the user message as `"Here is what you remember about me... Now answer this: {user_input}"`. This forces the 8B model to use stored memories.
 
-**Memory tiers (`memory/store.py`):**
-- `SHORT` — raw conversation turns, TTL: 3 sessions
-- `MID` — atomic facts (one per entry), TTL: 30 sessions
-- `LONG` — abstract facts, permanent; boosted x1.3 in retrieval
-- `WEB` — web-learned facts, calendar TTL (7-30 days), confidence decay
-
-**SQLite thread safety:** Gradio runs handlers in worker threads. `MemoryStore` uses `threading.local()` for per-thread SQLite connections to avoid `InterfaceError`.
+**Web search integration (`tools/web_augment.py`):**
+- When limbiq returns low-confidence results, `WebAugmenter` triggers a web search
+- Facts extracted from search results are stored via `lq.dopamine()` with `[Web]` prefix
+- ReAct loop (`tools/react_loop.py`) handles in-conversation tool calls (13 tools)
 
 **ReAct tool loop (`tools/react_loop.py`):**
 - 13 tools: `web_search`, `read_page`, `datetime`, `python`, `read_file`, `write_file`, `list_files`, `shell`, `weather`, `wikipedia`, `notify`, `http_get`, `http_post`
@@ -74,14 +71,16 @@ python consolidate.py --train  # Consolidate + trigger LoRA training
 - `MLXBackend` used for inference when adapter active; uses `make_sampler(temp=...)` for generation
 - MLX backend strips leaked Llama 3.1 template tokens (`<|eot_id|>`, `<|start_header_id|>`, etc.) post-generation
 - Training data lifecycle: `prepare_training_data()` writes `pending_ids.json`; `mark_training_complete()` marks as used only on success (prevents failed training from consuming data)
+- Training data module accesses limbiq's store via `lq._core.store.db` for conversation data
 
 ## Configuration
 
 All tunable parameters are in `config.py`:
 - `MODEL_PATH`, `N_CTX` (8192), `N_GPU_LAYERS`, `TEMPERATURE`, `MAX_TOKENS`
-- `SHORT_TERM_TTL`, `MID_TERM_TTL`, `TOP_K_MEMORIES`, `RELEVANCE_THRESHOLD` (0.1)
+- `LIMBIQ_STORE_PATH`, `USER_ID`, `EMBEDDING_MODEL`
 - `LORA_ENABLED`, `LORA_MIN_CONVERSATIONS` (3), `LORA_AUTO_TRAIN`, `LORA_MAX_ADAPTERS`
 - `LORA_RANK`, `LORA_LORA_LAYERS`, `LORA_LEARNING_RATE`, `MLX_MODEL_ID`
+- Web search: `WEB_SEARCH_ENABLED`, `SEARCH_BACKEND`, `SEARCH_MAX_RESULTS`
 
 ## Confabulation Test Suite
 
@@ -97,11 +96,46 @@ Results saved to `data/eval_results/`. Test categories: `false_memory` (1.x), `c
 
 ## Data Persistence
 
-- `data/memory.db` — SQLite (memory records + raw conversations)
-- `data/chroma/` — ChromaDB vector store (embeddings)
+- `data/limbiq/` — Limbiq's persistent storage (SQLite + embeddings, auto-managed)
 - `data/training/` — JSONL training files, `pending_ids.json`, `used_ids.json`
 - `data/adapters/` — LoRA adapters; `active_adapter.json` tracks current
 - `data/metrics/` — evaluation log (`metrics.jsonl`)
 - `data/eval_results/` — confabulation test results (JSON)
 
 All directories auto-created. Deleting `data/` resets all state.
+
+## Migration from Old Memory System
+
+If you have existing data from the pre-limbiq version (data/memory.db + data/chroma/):
+```bash
+python migrate_to_limbiq.py   # Migrates old data to limbiq
+```
+
+## Project Structure
+
+```
+living-llm/
+├── main.py                 # Chat interface (terminal + Gradio)
+├── engine.py               # Thin orchestrator using limbiq
+├── llm_backend.py          # LLM wrapper (llama-cpp + MLX)
+├── config.py               # All configuration
+├── consolidate.py          # Standalone consolidation + training trigger
+├── migrate_to_limbiq.py    # One-time migration script
+├── tools/
+│   ├── react_loop.py       # ReAct tool dispatch (13 tools)
+│   ├── web_augment.py      # Bridge between limbiq and web search
+│   ├── web_search.py       # DuckDuckGo/SearXNG search
+│   ├── web_reader.py       # Page content extraction
+│   └── ... (datetime, python, file, shell, weather, wikipedia, notify, http)
+├── memory/
+│   └── training_data.py    # Conversation -> JSONL for LoRA
+├── training/
+│   ├── adapter_manager.py  # Adapter lifecycle
+│   ├── lora_trainer.py     # MLX LoRA training
+│   └── eval.py             # Base vs adapted comparison
+└── data/
+    ├── limbiq/             # Limbiq's persistent storage
+    ├── training/           # LoRA training data
+    ├── adapters/           # LoRA adapter checkpoints
+    └── metrics/            # Evaluation logs
+```

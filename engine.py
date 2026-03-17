@@ -1,41 +1,29 @@
 """
-Conversation Engine — the orchestrator.
+Conversation Engine — now powered by limbiq.
 
-Ties together the LLM, memory system, LoRA adapter, and web search.
+The engine is a thin orchestrator:
+1. Ask limbiq for memory context (lq.process)
+2. Build prompt with that context
+3. Send to LLM (with optional ReAct tool loop)
+4. Tell limbiq what happened (lq.observe)
+5. On session end, limbiq consolidates (lq.end_session)
 
-For each user message:
-1. Search memory for relevant context (LONG, MID, WEB, SHORT tiers)
-2. Build system prompt with memory + optional tool-use instructions
-3. Run the ReAct loop (intercepts tool calls, executes web searches)
-4. Store the exchange in short-term memory
-5. If web search happened, extract and store learned facts
-6. On conversation end, trigger compression and optionally LoRA training
-
-LoRA integration:
-When a trained adapter is available, inference switches to MLXBackend.
-The user can toggle this with /adapter on|off.
-
-Web search integration:
-The ReAct loop lets the model call web_search() and read_page() tools.
-Tool calls are intercepted, executed, and results fed back until the
-model produces a final answer. Learned facts are stored in the WEB tier.
+All memory, learning, and adaptation logic lives in limbiq.
+LoRA training and web search remain in living-llm (limbiq is memory-only).
 """
 
 import re
+import json
 
 import config
+from limbiq import Limbiq
 from llm_backend import LLMBackend, MLXBackend
-from memory.store import MemoryStore, MemoryTier
-from memory.compressor import MemoryCompressor
-from memory.retriever import MemoryRetriever
-from memory.training_data import prepare_training_data, count_new_conversations, mark_training_complete
-from memory.web_knowledge import WebKnowledgeExtractor
+from tools.react_loop import ReactLoop
+from tools.web_augment import WebAugmenter
 from training.adapter_manager import AdapterManager
 from training.lora_trainer import LoRATrainer
 from training.eval import AdapterEvaluator
-from tools.react_loop import ReactLoop
-from tools.augmented_recall import AugmentedRecall
-from memory.confidence import MemoryClarity
+from memory.training_data import prepare_training_data, count_new_conversations, mark_training_complete
 
 _TOOL_TAG_RE = re.compile(r"<tool_(?:call|result)>.*?</tool_(?:call|result)>", re.DOTALL)
 
@@ -43,15 +31,20 @@ _TOOL_TAG_RE = re.compile(r"<tool_(?:call|result)>.*?</tool_(?:call|result)>", r
 class ConversationEngine:
     def __init__(self):
         self.llm = LLMBackend()           # llama-cpp, always available (base model)
-        self.store = MemoryStore()
-        self.compressor = MemoryCompressor(self.store, self.llm)
-        self.retriever = MemoryRetriever(self.store)
-        self.web_knowledge = WebKnowledgeExtractor(self.store, self.llm)
+
+        # Initialize limbiq with the LLM as the compression engine
+        self.lq = Limbiq(
+            store_path=config.LIMBIQ_STORE_PATH,
+            user_id=config.USER_ID,
+            embedding_model=config.EMBEDDING_MODEL,
+            llm_fn=self._llm_compress_fn,
+        )
+
         self.messages: list[dict] = []
         self._turn_count = 0
 
-        # Augmented recall — bridges blurry memory and web search
-        self.augmented_recall = AugmentedRecall(self.store, self.llm, self.retriever)
+        # Web search augmentation — bridges limbiq and web search
+        self.web_augmenter = WebAugmenter(self.lq, self.llm)
 
         # ReAct loop — session-scoped rate limiting persists across turns
         self.react_loop = ReactLoop(
@@ -71,110 +64,97 @@ class ConversationEngine:
         if config.LORA_ENABLED:
             self._try_load_active_adapter(quiet=True)
 
+    def _llm_compress_fn(self, prompt: str) -> str:
+        """Adapter: limbiq needs a simple fn(str) -> str for compression."""
+        return self.llm.chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.2,
+        )
+
     # ── Session ────────────────────────────────────────────────
 
     def start_session(self):
-        """Begin a new conversation session and age existing memories."""
-        self.store.new_session()
+        """Begin a new conversation session."""
+        self.lq.start_session()
         self.messages = []
         self._turn_count = 0
         self.react_loop.reset_session()
 
-        stats = self.store.get_stats()
-        parts = [
-            f"{stats['short']} short",
-            f"{stats['mid']} mid",
-            f"{stats['long']} long-term",
-        ]
-        if stats.get("web", 0):
-            parts.append(f"{stats['web']} web")
+        stats = self.lq.get_stats()
         adapter_note = " | adapter: on" if (self._mlx and self._adapter_enabled) else ""
-        print(f"  Memory: {' / '.join(parts)}{adapter_note}")
+        print(f"  Limbiq memory: {stats}{adapter_note}")
 
     def respond(self, user_input: str) -> str:
         """
         Process a user message and return the assistant's response.
 
         Pipeline:
-        1. Augmented recall — classify memory as CLEAR / BLURRY / ABSENT
-        2. If BLURRY, use memory as seed to search the web and merge results
-        3. If ABSENT and searchable, search fresh
-        4. Build prompt with memory + web context
-        5. Run the ReAct loop for any additional tool calls
-        6. Store exchange; extract web knowledge if searches happened
-        7. Check user feedback on previous augmented recall
+        1. Ask limbiq for enriched memory context
+        2. Optionally augment with web search
+        3. Build prompt with memory + web context
+        4. Run the ReAct loop for tool calls
+        5. Store exchange; tell limbiq what happened
         """
         self._turn_count += 1
 
         if self._pending_adapter:
             self._activate_pending_adapter()
 
-        # Check if previous turn's augmented recall got user feedback
-        if config.WEB_SEARCH_ENABLED:
-            self.augmented_recall.check_user_feedback(user_input)
+        # Step 1: Ask limbiq for enriched context
+        result = self.lq.process(
+            message=user_input,
+            conversation_history=self.messages[-(6 * 2):],
+        )
 
-        # Step 1: Augmented recall — memory retrieval + optional web search
-        if config.WEB_SEARCH_ENABLED:
-            recall_result = self.augmented_recall.recall_and_augment(user_input)
-        else:
-            recall_result = {
-                "clarity": "clear",
-                "memory_context": self.retriever.build_memory_prompt(user_input),
-                "web_context": None,
-                "search_performed": False,
-                "memory_updated": False,
-                "search_log": [],
-            }
+        # Log signals for debugging
+        if result.signals_fired:
+            for sig in result.signals_fired:
+                print(f"  [{sig.signal_type}] {sig.trigger}")
 
-        # Step 2: Build system prompt
+        # Step 2: Optionally augment with web search
+        web_context = None
+        search_log = []
+        if config.WEB_SEARCH_ENABLED:
+            web_result = self.web_augmenter.maybe_augment(user_input, result)
+            if web_result:
+                web_context = web_result["context"]
+                search_log = web_result.get("search_log", [])
+
+        # Step 3: Build system prompt
         system_content = config.SYSTEM_PROMPT
         if config.WEB_SEARCH_ENABLED:
             system_content += "\n\n" + config.TOOL_USE_PROMPT
 
-        if recall_result["memory_context"]:
-            system_content += "\n\n" + recall_result["memory_context"]
-            print(f"  [Context] Memory context injected ({len(recall_result['memory_context'])} chars)")
+        if result.context:
+            system_content += "\n\n" + result.context
+            print(f"  [Context] Memory context injected ({len(result.context)} chars)")
 
-        if recall_result["web_context"]:
+        if web_context:
             system_content += (
                 "\n\n<web_search_results>\n"
-                + recall_result["web_context"]
+                + web_context
                 + "\n</web_search_results>"
             )
-            print(f"  [Context] Web context injected ({len(recall_result['web_context'])} chars)")
+            print(f"  [Context] Web context injected ({len(web_context)} chars)")
 
-        # Add clarity hint so the model knows how to frame its response
-        if recall_result["clarity"] == "blurry":
-            system_content += (
-                "\n\nNOTE: Some of the context above came from augmenting blurry memories "
-                "with web search. When referencing this information, clearly distinguish "
-                "what you remembered vs what you just looked up. Example: 'I remembered "
-                "you mentioned something about X, and I looked it up to get the details...'"
-            )
-        elif recall_result["clarity"] == "absent" and recall_result["search_performed"]:
-            system_content += (
-                "\n\nNOTE: You had no memory of this topic, so the context above is from "
-                "a fresh web search. Be transparent: 'I don't have any previous knowledge "
-                "about this, but I searched and found...'"
-            )
-
-        # Step 3: Build messages
+        # Step 4: Build messages
         messages = [{"role": "system", "content": system_content}]
-        messages.extend(self.messages[-(6 * 2):])  # Last 6 turns
+        messages.extend(self.messages[-(6 * 2):])
 
         # Inject memory summary directly into the user message so the 8B model
         # can't miss it. Small models pay far more attention to user turns than
         # system content buried early in the context window.
         user_msg = user_input
-        has_context = recall_result["memory_context"] or recall_result["web_context"]
+        has_context = result.context or web_context
         if has_context:
             context_parts = []
-            if recall_result["memory_context"]:
-                context_parts.append(recall_result["memory_context"])
-            if recall_result["web_context"]:
+            if result.context:
+                context_parts.append(result.context)
+            if web_context:
                 context_parts.append(
                     "<web_search_results>\n"
-                    + recall_result["web_context"]
+                    + web_context
                     + "\n</web_search_results>"
                 )
             injected = "\n\n".join(context_parts)
@@ -189,9 +169,7 @@ class ConversationEngine:
 
         backend = self._active_backend()
 
-        # Step 4: Run ReAct loop (may do additional searches beyond augmented recall)
-        search_log = list(recall_result.get("search_log", []))
-
+        # Step 5: Run ReAct loop (may do additional searches)
         if config.WEB_SEARCH_ENABLED:
             response, react_log = self.react_loop.run(backend, messages)
             search_log.extend(react_log)
@@ -205,76 +183,65 @@ class ConversationEngine:
         # Clean up any stray tool tags that slipped through
         response = _TOOL_TAG_RE.sub("", response).strip()
 
-        # Step 5: Store exchange
+        # Step 6: Store exchange and tell limbiq
         self.messages.append({"role": "user", "content": user_input})
         self.messages.append({"role": "assistant", "content": response})
 
-        self.store.store_memory(
-            content=f"User said: {user_input}",
-            tier=MemoryTier.SHORT,
-            metadata={"turn": self._turn_count, "type": "user_message"},
+        self.lq.observe(
+            message=user_input,
+            response=response,
         )
 
-        # Step 6: Extract web knowledge from any searches
+        # Store web facts through limbiq if web searches happened
         if search_log:
-            self.web_knowledge.extract_and_store(user_input, search_log, response)
-
-        # Step 7: Log recall outcome
-        if recall_result["search_performed"]:
-            updated = "updated" if recall_result["memory_updated"] else "unchanged"
-            print(f"  [Recall] {recall_result['clarity']} -> searched web -> memory {updated}")
+            self.web_augmenter.store_web_facts(user_input, search_log, response)
 
         return response
 
     def end_session(self):
-        """End conversation: store it, compress memories, optionally train."""
+        """End session — limbiq handles all consolidation."""
         if not self.messages:
             return {}
 
-        self.store.store_conversation(self.messages)
-        results = {"turns": self._turn_count}
+        print("\n  Limbiq consolidating...")
+        results = self.lq.end_session()
+        print(f"  Compressed: {results.get('compressed', 0)} facts")
+        print(f"  Suppressed: {results.get('suppressed', 0)} stale memories")
+        print(f"  Deleted: {results.get('deleted', 0)} old suppressed")
 
-        if config.CONSOLIDATE_ON_EXIT:
-            print("\n  Consolidating memories...")
-            compression_results = self.compressor.run_full_cycle()
-            results.update(compression_results)
+        # Auto-train if enough fresh conversations
+        if config.LORA_ENABLED and not self._training_active:
+            new_convos = count_new_conversations(self.lq._core.store)
+            if self.adapter_manager.should_auto_train(new_convos):
+                print(f"  {new_convos} new conversation(s) ready — triggering LoRA training...")
+                self._start_training_background()
 
-            if compression_results["conversations_compressed"] > 0:
-                print(f"  Compressed {compression_results['conversations_compressed']} conversation(s) into gists")
-            if compression_results["long_term_consolidated"]:
-                print("  Consolidated gists into long-term facts")
-            if compression_results["memories_expired"] > 0:
-                print(f"  Expired {compression_results['memories_expired']} old memories")
-
-            # Web knowledge decay (calendar-based, not session-based)
-            decay = self.web_knowledge.decay_old_knowledge()
-            if decay["deleted"] > 0:
-                print(f"  Expired {decay['deleted']} stale web knowledge entries")
-            if decay["decayed"] > 0:
-                print(f"  Decayed confidence on {decay['decayed']} web knowledge entries")
-
-            # Auto-train if enough fresh conversations
-            if config.LORA_ENABLED and not self._training_active:
-                new_convos = count_new_conversations(self.store)
-                if self.adapter_manager.should_auto_train(new_convos):
-                    print(f"  {new_convos} new conversation(s) ready — triggering LoRA training in background...")
-                    self._start_training_background()
-
-        stats = self.store.get_stats()
-        web_note = f" / {stats['web']} web" if stats.get("web", 0) else ""
-        print(f"  Memory now: {stats['short']} short / {stats['mid']} mid / {stats['long']} long-term{web_note}")
+        stats = self.lq.get_stats()
+        print(f"  Memory now: {stats}")
 
         return results
+
+    # ── Feedback ───────────────────────────────────────────────
+
+    def handle_feedback(self, feedback_type: str, detail: str = None):
+        """Handle explicit user feedback signals."""
+        if feedback_type == "positive":
+            if self.messages:
+                last_user_msg = None
+                for m in reversed(self.messages):
+                    if m["role"] == "user":
+                        last_user_msg = m["content"]
+                        break
+                if last_user_msg:
+                    self.lq.dopamine(f"User positively received response about: {last_user_msg[:200]}")
+
+        elif feedback_type == "correction" and detail:
+            self.lq.correct(detail)
 
     # ── Web search commands ────────────────────────────────────
 
     def forced_search(self, query: str) -> str:
-        """
-        Directly execute a web search and generate a response.
-
-        Used by the /search command — bypasses the ReAct loop for reliability
-        (the model is explicitly given the results rather than deciding to search).
-        """
+        """Directly execute a web search and generate a response."""
         try:
             from tools.web_search import search as do_search, format_results_for_prompt
             results = do_search(query)
@@ -298,25 +265,12 @@ class ConversationEngine:
         ]
 
         response = self._active_backend().chat(messages)
+
+        # Store web facts through limbiq
         search_log = [{"type": "search", "query": query, "results": results}]
-        self.web_knowledge.extract_and_store(query, search_log, response)
+        self.web_augmenter.store_web_facts(query, search_log, response)
+
         return response
-
-    def get_web_knowledge(self) -> list:
-        """Return all stored web knowledge entries."""
-        return self.store.get_memories_by_tier(MemoryTier.WEB)
-
-    def clear_web_knowledge(self):
-        """Delete all WEB tier memories."""
-        memories = self.store.get_memories_by_tier(MemoryTier.WEB)
-        for m in memories:
-            self.store.delete_memory(m.id)
-        print(f"  Cleared {len(memories)} web knowledge entries.")
-
-    def decay_web_knowledge(self):
-        """Manually trigger confidence decay on web knowledge."""
-        result = self.web_knowledge.decay_old_knowledge()
-        print(f"  Decayed: {result['decayed']}  |  Deleted (expired): {result['deleted']}")
 
     # ── LoRA adapter commands ──────────────────────────────────
 
@@ -331,7 +285,7 @@ class ConversationEngine:
         if not self.trainer.is_available():
             print("  mlx_lm not found. Install with: pip install mlx-lm")
             return False
-        new_convos = count_new_conversations(self.store)
+        new_convos = count_new_conversations(self.lq._core.store)
         if new_convos == 0:
             print("  No new conversations to train on.")
             print("  (Need compressed conversations — have a few chats and run /quit first)")
@@ -383,64 +337,20 @@ class ConversationEngine:
         status.update(self.evaluator.get_summary())
         return status
 
-    # ── Augmented recall commands ─────────────────────────────
-
-    def debug_recall(self, query: str) -> dict:
-        """Run augmented recall and return the full assessment (for /recall)."""
-        recall_result = self.augmented_recall.recall_and_augment(query)
-        assessment = recall_result.get("assessment")
-        return {
-            "clarity": recall_result["clarity"],
-            "confidence": assessment.confidence if assessment else 0.0,
-            "missing_details": assessment.missing_details if assessment else [],
-            "suggested_search": assessment.suggested_search if assessment else None,
-            "memories_found": len(assessment.memories) if assessment else 0,
-            "memory_texts": [m.content for m in (assessment.memories if assessment else [])],
-            "search_performed": recall_result["search_performed"],
-            "memory_updated": recall_result["memory_updated"],
-            "web_context": recall_result.get("web_context"),
-        }
-
-    def sharpen_memories(self) -> int:
-        """
-        Proactively enrich blurry memories with web search.
-        Like reviewing and updating old notes.
-        """
-        all_memories = (
-            self.store.get_memories_by_tier(MemoryTier.MID)
-            + self.store.get_memories_by_tier(MemoryTier.LONG)
-        )
-
-        sharpened = 0
-        for memory in all_memories:
-            if memory.session_count < 3 and memory.relevance_score > 0.7:
-                continue
-
-            assessment = self.augmented_recall.classifier.assess(
-                memory.content, [memory]
-            )
-
-            if assessment.clarity == MemoryClarity.BLURRY and assessment.suggested_search:
-                result = self.augmented_recall._augment_blurry_memory(
-                    memory.content, assessment
-                )
-                if result and result["memory_updated"]:
-                    sharpened += 1
-                    print(f"  Sharpened: {memory.content[:60]}...")
-
-        return sharpened
-
     # ── Memory debug ───────────────────────────────────────────
 
     def get_memory_debug(self) -> dict:
-        """Return current memory state for debugging."""
+        """Return current memory state for debugging / UI display."""
         return {
-            "stats": self.store.get_stats(),
-            "session_id": self.store.session_id,
+            "stats": self.lq.get_stats(),
+            "priority": [m.content for m in self.lq.get_priority_memories()],
+            "suppressed_count": len(self.lq.get_suppressed()),
+            "recent_signals": [
+                {"type": s.signal_type if isinstance(s.signal_type, str) else s.signal_type.value,
+                 "trigger": s.trigger}
+                for s in self.lq.get_signal_log(limit=10)
+            ],
             "turn_count": self._turn_count,
-            "long_term": [m.content for m in self.store.get_memories_by_tier(MemoryTier.LONG)],
-            "mid_term": [m.content for m in self.store.get_memories_by_tier(MemoryTier.MID)],
-            "web_knowledge": self.store.get_memories_by_tier(MemoryTier.WEB),
         }
 
     # ── Internal ───────────────────────────────────────────────
@@ -467,9 +377,9 @@ class ConversationEngine:
             self._mlx = None
 
     def _start_training_background(self) -> bool:
-        training_dir = prepare_training_data(self.store)
+        training_dir = prepare_training_data(self.lq._core.store)
         if training_dir is None:
-            new_convos = count_new_conversations(self.store)
+            new_convos = count_new_conversations(self.lq._core.store)
             print(f"  Not enough quality data yet ({new_convos} new, need {config.LORA_MIN_CONVERSATIONS})")
             return False
 
@@ -478,20 +388,19 @@ class ConversationEngine:
         def _on_done(adapter_path: str | None):
             self._training_active = False
             if adapter_path:
-                # Only now mark conversations as used — failed training shouldn't consume them
                 mark_training_complete(training_dir)
                 self.adapter_manager.on_training_complete(adapter_path)
                 self._pending_adapter = adapter_path
                 self.evaluator.log_training_event(
                     adapter_path=adapter_path,
-                    num_conversations=count_new_conversations(self.store),
-                    training_iters=self.trainer._compute_iters(count_new_conversations(self.store)),
+                    num_conversations=count_new_conversations(self.lq._core.store),
+                    training_iters=self.trainer._compute_iters(count_new_conversations(self.lq._core.store)),
                 )
                 print(f"\n  [Training complete — adapter ready, will load on next message]")
             else:
                 print("\n  [Training failed — check output above]")
 
-        new_convos = count_new_conversations(self.store)
+        new_convos = count_new_conversations(self.lq._core.store)
         self.trainer.train_background(training_dir, num_conversations=new_convos, callback=_on_done)
         return True
 

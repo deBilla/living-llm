@@ -22,27 +22,17 @@ N_THREADS = 8         # CPU threads for non-GPU work
 TEMPERATURE = 0.7
 MAX_TOKENS = 1024
 
-# Memory system
-SQLITE_PATH = str(DATA_DIR / "memory.db")
-CHROMA_PATH = str(DATA_DIR / "chroma")
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Fast, good quality, runs on CPU
+# Limbiq — replaces the old memory system (SQLite, ChromaDB, compressor, retriever)
+LIMBIQ_STORE_PATH = str(DATA_DIR / "limbiq")
+USER_ID = "default"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Memory tiers — TTL in number of conversations
-SHORT_TERM_TTL = 3        # Keep full conversations for 3 sessions
-MID_TERM_TTL = 30         # Keep gists for 30 sessions
-LONG_TERM_TTL = None      # Permanent
-
-# Retrieval
-TOP_K_MEMORIES = 5        # How many memories to inject as context
-RELEVANCE_THRESHOLD = 0.1 # Minimum similarity score to include
-
-# Compression
-GIST_MAX_TOKENS = 200     # Max tokens for a mid-term gist
-FACT_MAX_TOKENS = 100     # Max tokens for a long-term fact
+# Compression (used by limbiq's llm_fn adapter)
+GIST_MAX_TOKENS = 200
+FACT_MAX_TOKENS = 100
 
 # Consolidation
-CONSOLIDATE_ON_EXIT = True       # Run compression when chat ends
-CONSOLIDATE_INTERVAL_MINS = 30   # Background consolidation interval
+CONSOLIDATE_ON_EXIT = True
 
 # LoRA / Adapter Training
 # Uses Apple's MLX framework for training — purpose-built for Apple Silicon.
@@ -75,12 +65,6 @@ SEARCH_COOLDOWN_SECS = 2             # Minimum seconds between searches
 SEARCH_MAX_PER_SESSION = 20          # Cap to prevent runaway searching
 WEB_READER_MAX_CHARS = 4000          # Truncate extracted page content
 WEB_READER_TIMEOUT_SECS = 10
-
-# Web knowledge memory — stored in WEB tier with time-based TTL (not session-based)
-WEB_KNOWLEDGE_TTL_DAYS = 30          # General facts expire after this many days
-WEB_NEWS_TTL_DAYS = 7                # News-type facts expire faster
-WEB_CONFIDENCE_INITIAL = 0.7         # Web facts start lower than user-stated facts
-WEB_CONFIDENCE_DECAY_RATE = 0.05     # Confidence drop per day after TTL
 
 # Tool-use instructions injected into the system prompt when web search is enabled.
 # These tell the model WHEN to search and HOW to format tool calls.
@@ -132,10 +116,9 @@ SYSTEM_PROMPT = """You are a helpful AI assistant with a persistent memory syste
 YOUR #1 RULE: If <memory_context> or <web_search_results> tags appear in this prompt, they contain REAL information. You MUST use that information to answer the user. Do NOT ignore it. Do NOT say you don't have information when these tags are present.
 
 How to use context that is provided to you:
-- [KNOWN FACTS] and [STORED FACTS] sections: treat as established truth about this user. Reference confidently: "You mentioned that..." or "I know that you..."
-- [Knowledge from web searches] section: reference with the source: "According to [source]..."
-- [Augmented recall] section: some info came from memory, some from web search. Be transparent about which is which.
-- [Recent exchanges] section: recent conversation fragments for continuity.
+- [IMPORTANT -- known facts about this user] section: treat as established truth about this user. Reference confidently: "You mentioned that..." or "I know that you..."
+- [Relevant memories from previous conversations] section: reference with confidence proportional to the stated confidence level.
+- When web search results are included, reference with the source: "According to [source]..."
 
 ONLY when NO <memory_context> and NO <web_search_results> tags appear:
 - You have no information about previous conversations. Say so honestly.

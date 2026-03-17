@@ -2,7 +2,7 @@
 Living LLM — Main entry point.
 
 Terminal chat interface with optional Gradio web UI.
-Supports special commands for memory inspection.
+Powered by limbiq for neurotransmitter-inspired adaptive learning.
 
 Usage:
     python main.py           # Terminal mode
@@ -10,6 +10,7 @@ Usage:
 """
 
 import sys
+import json
 import argparse
 
 from engine import ConversationEngine
@@ -42,71 +43,9 @@ def _print_adapter_status(status: dict, console, use_rich: bool):
         print()
 
 
-def _print_web_knowledge(memories: list, console, use_rich: bool):
-    import time
-    if not memories:
-        msg = "No web knowledge stored. Ask something that requires a web search."
-        if use_rich:
-            from rich.panel import Panel
-            console.print(Panel(msg, title="web knowledge", border_style="cyan"))
-        else:
-            print(f"\n{msg}\n")
-        return
-
-    if use_rich:
-        from rich.panel import Panel
-        lines = [f"[bold]{len(memories)} entries stored[/bold]\n"]
-        for m in memories:
-            conf = m.metadata.get("confidence", 0.7)
-            urls = m.metadata.get("source_urls", [])
-            src = urls[0] if urls else "web"
-            age_days = (time.time() - m.metadata.get("retrieved_at", m.created_at)) / 86400
-            is_news = m.metadata.get("is_news", False)
-            lines.append(
-                f"  [{conf:.0%}] {m.content}\n"
-                f"        Source: {src}  |  Age: {age_days:.1f}d  |  {'news' if is_news else 'general'}"
-            )
-        console.print(Panel("\n".join(lines), title="web knowledge", border_style="cyan"))
-    else:
-        print(f"\n--- Web Knowledge ({len(memories)} entries) ---")
-        for m in memories:
-            conf = m.metadata.get("confidence", 0.7)
-            src = (m.metadata.get("source_urls") or ["web"])[0]
-            print(f"  [{conf:.0%}] {m.content}")
-            print(f"        {src}")
-        print()
-
-
-def _print_recall_debug(info: dict, console, use_rich: bool):
-    clarity_icons = {"clear": "CLEAR", "blurry": "BLURRY", "absent": "ABSENT"}
-    tag = clarity_icons.get(info["clarity"], info["clarity"])
-    lines = [
-        f"Clarity: {tag}  |  Confidence: {info['confidence']:.2f}  |  Memories found: {info['memories_found']}",
-        f"Search performed: {info['search_performed']}  |  Memory updated: {info['memory_updated']}",
-    ]
-    if info["missing_details"]:
-        lines.append(f"Missing: {', '.join(info['missing_details'])}")
-    if info["suggested_search"]:
-        lines.append(f"Suggested search: {info['suggested_search']}")
-    if info["memory_texts"]:
-        lines.append("\nRetrieved memories:")
-        for t in info["memory_texts"]:
-            lines.append(f"  - {t}")
-    if info["web_context"]:
-        lines.append(f"\nWeb context:\n{info['web_context'][:500]}")
-
-    text = "\n".join(lines)
-    if use_rich:
-        from rich.panel import Panel
-        console.print(Panel(text, title="augmented recall", border_style="magenta"))
-    else:
-        print(f"\n--- Augmented Recall ---\n{text}\n")
-
-
 def _print_comparison(result: dict, console, use_rich: bool):
     if use_rich:
         from rich.panel import Panel
-        from rich.columns import Columns
         console.print(Panel(result["base"], title="base model", border_style="yellow"))
         console.print(Panel(result["adapted"], title="adapted model", border_style="green"))
     else:
@@ -131,14 +70,18 @@ def run_terminal():
     def print_header():
         if use_rich:
             console.print(Panel(
-                "[bold]Living LLM[/bold] — A continuously learning language model\n"
-                "  [bold]/memory[/bold]           inspect memory state\n"
+                "[bold]Living LLM[/bold] — powered by [cyan]limbiq[/cyan]\n"
+                "  [bold]/memory[/bold]           limbiq memory state\n"
+                "  [bold]/signals[/bold]          recent signal history\n"
+                "  [bold]/priority[/bold]         dopamine-tagged memories\n"
+                "  [bold]/suppress[/bold]         GABA-suppressed memories\n"
+                "  [bold]/dopamine <fact>[/bold]  tag a fact as high-priority\n"
+                "  [bold]/correct <info>[/bold]   correct a wrong memory\n"
+                "  [bold]/good[/bold]             mark last response as positive\n"
+                "  [bold]/bad[/bold]              mark last response as negative\n"
+                "  [bold]/restore <id>[/bold]     restore a suppressed memory\n"
                 "  [bold]/search <query>[/bold]   force a web search\n"
-                "  [bold]/recall <query>[/bold]   debug augmented recall assessment\n"
-                "  [bold]/sharpen[/bold]          enrich blurry memories with web search\n"
-                "  [bold]/knowledge[/bold]        show stored web knowledge\n"
-                "  [bold]/knowledge clear[/bold]  clear all web knowledge\n"
-                "  [bold]/knowledge decay[/bold]  run confidence decay\n"
+                "  [bold]/export[/bold]           export limbiq state as JSON\n"
                 "  [bold]/train[/bold]            train LoRA adapter\n"
                 "  [bold]/adapter[/bold]          show adapter status\n"
                 "  [bold]/adapter compare[/bold]  compare base vs adapted\n"
@@ -149,21 +92,26 @@ def run_terminal():
                 border_style="blue",
             ))
         else:
-            print("\n" + "=" * 50)
-            print("  Living LLM — A continuously learning language model")
-            print("  /memory              — inspect memory state")
+            print("\n" + "=" * 55)
+            print("  Living LLM — powered by limbiq")
+            print("  /memory              — limbiq memory state")
+            print("  /signals             — recent signal history")
+            print("  /priority            — dopamine-tagged memories")
+            print("  /suppress            — GABA-suppressed memories")
+            print("  /dopamine <fact>     — tag fact as priority")
+            print("  /correct <info>      — correct a wrong memory")
+            print("  /good                — positive feedback")
+            print("  /bad                 — negative feedback")
+            print("  /restore <id>        — restore suppressed memory")
             print("  /search <query>      — force web search")
-            print("  /recall <query>      — debug augmented recall")
-            print("  /sharpen             — enrich blurry memories")
-            print("  /knowledge           — show web knowledge")
-            print("  /knowledge clear     — clear web knowledge")
-            print("  /knowledge decay     — run confidence decay")
+            print("  /export              — export limbiq state")
             print("  /train               — train LoRA adapter")
             print("  /adapter             — adapter status")
             print("  /adapter compare     — compare base vs adapted")
             print("  /adapter off|on      — toggle adapter")
+            print("  /new                 — new session")
             print("  /quit                — end session")
-            print("=" * 50)
+            print("=" * 55)
 
     def print_response(text):
         if use_rich:
@@ -172,41 +120,41 @@ def run_terminal():
             print(f"\nAssistant: {text}\n")
 
     def print_memory(debug_info):
+        stats = debug_info["stats"]
         if use_rich:
-            stats = debug_info["stats"]
-            console.print(Panel(
-                f"[bold]Session:[/bold] {debug_info['session_id']}  |  "
-                f"[bold]Turns:[/bold] {debug_info['turn_count']}\n\n"
-                f"[bold blue]Short-term:[/bold blue] {stats['short']} memories\n"
-                f"[bold yellow]Mid-term:[/bold yellow] {stats['mid']} gists\n"
-                f"[bold green]Long-term:[/bold green] {stats['long']} facts\n"
-                f"[bold cyan]Web knowledge:[/bold cyan] {stats.get('web', 0)} entries\n"
-                f"[bold]Conversations stored:[/bold] {stats['conversations']}",
-                title="memory state",
-                border_style="yellow",
-            ))
-            if debug_info["long_term"]:
-                console.print("\n[bold green]Long-term knowledge:[/bold green]")
-                for fact in debug_info["long_term"]:
-                    console.print(f"  {fact}")
-            if debug_info["mid_term"]:
-                console.print("\n[bold yellow]Mid-term gists:[/bold yellow]")
-                for gist in debug_info["mid_term"]:
-                    console.print(f"  {gist}")
-            console.print()
+            lines = [
+                f"[bold]Turns:[/bold] {debug_info['turn_count']}\n",
+            ]
+            for key, val in stats.items():
+                lines.append(f"[bold]{key}:[/bold] {val}")
+
+            if debug_info["priority"]:
+                lines.append("\n[bold green]Priority memories (Dopamine-tagged):[/bold green]")
+                for fact in debug_info["priority"]:
+                    lines.append(f"  {fact}")
+
+            lines.append(f"\n[bold red]Suppressed:[/bold red] {debug_info['suppressed_count']} memories")
+
+            if debug_info["recent_signals"]:
+                lines.append("\n[bold cyan]Recent signals:[/bold cyan]")
+                for sig in debug_info["recent_signals"]:
+                    lines.append(f"  [{sig['type']}] {sig['trigger']}")
+
+            console.print(Panel("\n".join(lines), title="limbiq memory", border_style="yellow"))
         else:
-            stats = debug_info["stats"]
-            print(f"\n--- Memory State ---")
-            print(f"Session: {debug_info['session_id']}  |  Turns: {debug_info['turn_count']}")
-            print(f"Short-term: {stats['short']} | Mid-term: {stats['mid']} | Long-term: {stats['long']}")
-            if debug_info["long_term"]:
-                print("\nLong-term knowledge:")
-                for fact in debug_info["long_term"]:
+            print(f"\n--- Limbiq Memory ---")
+            print(f"Turns: {debug_info['turn_count']}")
+            for key, val in stats.items():
+                print(f"  {key}: {val}")
+            if debug_info["priority"]:
+                print("\nPriority memories:")
+                for fact in debug_info["priority"]:
                     print(f"  {fact}")
-            if debug_info["mid_term"]:
-                print("\nMid-term gists:")
-                for gist in debug_info["mid_term"]:
-                    print(f"  {gist}")
+            print(f"\nSuppressed: {debug_info['suppressed_count']} memories")
+            if debug_info["recent_signals"]:
+                print("\nRecent signals:")
+                for sig in debug_info["recent_signals"]:
+                    print(f"  [{sig['type']}] {sig['trigger']}")
             print()
 
     # Initialize
@@ -229,11 +177,85 @@ def run_terminal():
         if user_input.lower() in ("/quit", "/exit", "/q"):
             print("\nEnding session...")
             results = engine.end_session()
-            print(f"\nSession complete. {results.get('turns', 0)} turns.")
+            print(f"\nSession complete.")
             break
 
         if user_input.lower() in ("/memory", "/mem", "/m"):
             print_memory(engine.get_memory_debug())
+            continue
+
+        if user_input.lower() in ("/signals", "/sig"):
+            signals = engine.lq.get_signal_log(limit=20)
+            if not signals:
+                print("  No signals fired yet.")
+            else:
+                for s in signals:
+                    stype = s.signal_type if isinstance(s.signal_type, str) else s.signal_type.value
+                    print(f"  [{stype}] {s.trigger} — {s.details}")
+            continue
+
+        if user_input.lower() in ("/priority", "/pri"):
+            memories = engine.lq.get_priority_memories()
+            if memories:
+                for m in memories:
+                    print(f"  [{m.id[:8]}] {m.content}")
+            else:
+                print("  No priority memories yet.")
+            continue
+
+        if user_input.lower() == "/suppress":
+            memories = engine.lq.get_suppressed()
+            if memories:
+                for m in memories:
+                    print(f"  [{m.id[:8]}] {m.content} (reason: {m.suppression_reason})")
+            else:
+                print("  No suppressed memories.")
+            continue
+
+        if user_input.lower().startswith("/dopamine "):
+            fact = user_input[len("/dopamine "):].strip()
+            if fact:
+                engine.lq.dopamine(fact)
+                print(f"  Dopamine tagged: {fact}")
+            continue
+
+        if user_input.lower().startswith("/gaba "):
+            memory_id = user_input[len("/gaba "):].strip()
+            if memory_id:
+                engine.lq.gaba(memory_id)
+                print(f"  Memory {memory_id} suppressed.")
+            continue
+
+        if user_input.lower().startswith("/correct "):
+            correction = user_input[len("/correct "):].strip()
+            if correction:
+                engine.lq.correct(correction)
+                print(f"  Correction applied: {correction}")
+            continue
+
+        if user_input.lower() == "/good":
+            engine.handle_feedback("positive")
+            print("  Positive feedback recorded.")
+            continue
+
+        if user_input.lower() == "/bad":
+            engine.handle_feedback("negative")
+            print("  Negative feedback recorded.")
+            continue
+
+        if user_input.lower().startswith("/restore "):
+            memory_id = user_input[len("/restore "):].strip()
+            if memory_id:
+                engine.lq.restore_memory(memory_id)
+                print(f"  Memory {memory_id} restored.")
+            continue
+
+        if user_input.lower() == "/export":
+            state = engine.lq.export_state()
+            export_path = "data/limbiq_export.json"
+            with open(export_path, "w") as f:
+                json.dump(state, f, indent=2, default=str)
+            print(f"  Exported to {export_path}")
             continue
 
         if user_input.lower() == "/new":
@@ -257,34 +279,6 @@ def run_terminal():
                 print_response(response)
             continue
 
-        if user_input.lower() == "/knowledge":
-            _print_web_knowledge(engine.get_web_knowledge(), console, use_rich)
-            continue
-
-        if user_input.lower() == "/knowledge clear":
-            engine.clear_web_knowledge()
-            continue
-
-        if user_input.lower() == "/knowledge decay":
-            engine.decay_web_knowledge()
-            continue
-
-        if user_input.lower().startswith("/recall "):
-            query = user_input[8:].strip()
-            if not query:
-                print("  Usage: /recall <query>")
-            else:
-                print(f"\n  Assessing recall for: {query!r}...")
-                info = engine.debug_recall(query)
-                _print_recall_debug(info, console, use_rich)
-            continue
-
-        if user_input.lower() == "/sharpen":
-            print("\n  Sharpening blurry memories with web search...")
-            count = engine.sharpen_memories()
-            print(f"  Done. Sharpened {count} memor{'y' if count == 1 else 'ies'}.")
-            continue
-
         if user_input.lower() == "/train":
             print("\nTriggering LoRA training...")
             engine.train_now()
@@ -303,11 +297,9 @@ def run_terminal():
             continue
 
         if user_input.lower().startswith("/adapter compare"):
-            # Use the last user message as the comparison prompt, or ask for one
             parts = user_input.split(maxsplit=2)
             prompt = parts[2] if len(parts) > 2 else None
             if not prompt:
-                # Use the last user turn from this session if available
                 user_turns = [m["content"] for m in engine.messages if m["role"] == "user"]
                 prompt = user_turns[-1] if user_turns else "Tell me about yourself."
             print(f"\nComparing responses for: {prompt!r}\n")
@@ -332,7 +324,6 @@ def run_terminal():
 def run_gradio():
     """Launch Gradio web interface."""
     import gradio as gr
-    import time
 
     engine = ConversationEngine()
     engine.start_session()
@@ -351,101 +342,99 @@ def run_gradio():
 
     # ── Data helpers ──────────────────────────────────────────
 
-    def _overview_md():
+    def _memory_md():
         debug = engine.get_memory_debug()
         stats = debug["stats"]
         status = engine.get_adapter_status()
         adapter_line = (
-            f"✅ **Adapter active** (`{status.get('adapter_name', '?')}`)"
+            f"**Adapter active** (`{status.get('adapter_name', '?')}`)"
             if status.get("adapter_active")
-            else ("⏳ **Training running**" if status.get("training_running") else "⚪ No adapter")
+            else ("**Training running**" if status.get("training_running") else "No adapter")
         )
         lines = [
-            f"**Session:** `{debug['session_id']}`  |  **Turns:** {debug['turn_count']}",
+            f"**Turns:** {debug['turn_count']}",
             "",
-            f"| Tier | Count |",
-            f"|------|-------|",
-            f"| Short-term | {stats['short']} |",
-            f"| Mid-term | {stats['mid']} |",
-            f"| Long-term | {stats['long']} |",
-            f"| Web knowledge | {stats.get('web', 0)} |",
-            f"| Conversations | {stats['conversations']} |",
-            "",
-            f"**LoRA:** {adapter_line}",
+            "| Metric | Count |",
+            "|--------|-------|",
         ]
+        for key, val in stats.items():
+            lines.append(f"| {key} | {val} |")
+        lines.append("")
+        lines.append(f"**LoRA:** {adapter_line}")
         return "\n".join(lines)
 
-    def _longterm_md():
+    def _priority_md():
         debug = engine.get_memory_debug()
-        facts = debug["long_term"]
+        facts = debug["priority"]
         if not facts:
-            return "_No long-term facts yet. Have a few conversations and end them with /quit._"
+            return "_No priority memories yet. Share some personal info or use the Dopamine action._"
         return "\n".join(f"- {f}" for f in facts)
 
-    def _midterm_md():
-        debug = engine.get_memory_debug()
-        gists = debug["mid_term"]
-        if not gists:
-            return "_No mid-term gists yet._"
-        return "\n".join(f"- {g}" for g in gists)
+    def _signals_md():
+        signals = engine.lq.get_signal_log(limit=30)
+        if not signals:
+            return "_No signals fired yet._"
+        lines = []
+        for s in signals:
+            stype = s.signal_type if isinstance(s.signal_type, str) else s.signal_type.value
+            lines.append(f"**[{stype}]** {s.trigger}")
+        return "\n".join(lines)
 
-    def _web_md():
-        import time as _time
-        memories = engine.get_web_knowledge()
+    def _suppressed_md():
+        memories = engine.lq.get_suppressed()
         if not memories:
-            return "_No web knowledge stored. Use the search bar or ask questions that need current info._"
-        lines = [f"**{len(memories)} entries**\n"]
+            return "_No suppressed memories._"
+        lines = []
         for m in memories:
-            conf = m.metadata.get("confidence", 0.7)
-            urls = m.metadata.get("source_urls", [])
-            src = urls[0] if urls else "web"
-            age_days = (_time.time() - m.metadata.get("retrieved_at", m.created_at)) / 86400
-            is_news = m.metadata.get("is_news", False)
-            tag = "📰" if is_news else "🌐"
-            lines.append(
-                f"{tag} **[{conf:.0%}]** {m.content}  \n"
-                f"  _{src}_  ·  {age_days:.1f}d ago"
-            )
-        return "\n\n".join(lines)
+            lines.append(f"- `{m.id[:8]}` {m.content} _(reason: {m.suppression_reason})_")
+        return "\n".join(lines)
 
-    def _all_memory():
-        return _overview_md(), _longterm_md(), _midterm_md(), _web_md()
+    def _all_panels():
+        return _memory_md(), _priority_md(), _signals_md(), _suppressed_md()
 
     # ── Event handlers ────────────────────────────────────────
 
     def chat(message, history):
         if not message.strip():
-            return history, "", *_all_memory()
+            return history, "", *_all_panels()
         response = engine.respond(message)
         history = (history or []) + [
             {"role": "user", "content": message},
             {"role": "assistant", "content": response},
         ]
-        return history, "", *_all_memory()
+        return history, "", *_all_panels()
 
     def do_search(query):
         if not query.strip():
-            return gr.update(), "", *_all_memory()
+            return gr.update(), "", *_all_panels()
         response = engine.forced_search(query)
-        return response, "", *_all_memory()
+        return response, "", *_all_panels()
 
     def new_session():
         engine.end_session()
         engine.start_session()
-        return [], *_all_memory()
+        return [], *_all_panels()
 
-    def clear_web():
-        engine.clear_web_knowledge()
-        return _web_md()
+    def apply_dopamine(fact):
+        if fact.strip():
+            engine.lq.dopamine(fact.strip())
+            return f"Tagged as priority: {fact}", *_all_panels()
+        return "Enter a fact to tag.", *_all_panels()
 
-    def decay_web():
-        engine.decay_web_knowledge()
-        return _web_md()
+    def apply_correction(correction):
+        if correction.strip():
+            engine.lq.correct(correction.strip())
+            return f"Correction applied: {correction}", *_all_panels()
+        return "Enter a correction.", *_all_panels()
+
+    def mark_good():
+        engine.handle_feedback("positive")
+        return _all_panels()
 
     # ── Layout ────────────────────────────────────────────────
 
-    with gr.Blocks(title="Living LLM") as demo:
-        gr.Markdown("## 🧠 Living LLM — continuously learning language model")
+    with gr.Blocks(title="Living LLM + Limbiq") as demo:
+        gr.Markdown("## Living LLM — powered by **limbiq** (neurotransmitter-inspired adaptive learning)")
 
         with gr.Row(equal_height=True, elem_classes="main-row"):
             # ── Left: chat panel ──────────────────────────────
@@ -457,7 +446,7 @@ def run_gradio():
                 )
                 with gr.Row(elem_classes="input-row"):
                     msg_box = gr.Textbox(
-                        placeholder="Type a message… (Enter to send)",
+                        placeholder="Type a message... (Enter to send)",
                         show_label=False,
                         lines=1,
                         scale=8,
@@ -465,10 +454,10 @@ def run_gradio():
                     )
                     send_btn = gr.Button("Send", variant="primary", scale=1, elem_id="send-btn")
 
-                with gr.Accordion("🔍 Web search", open=False):
+                with gr.Accordion("Web search", open=False):
                     with gr.Row():
                         search_box = gr.Textbox(
-                            placeholder="Search query…",
+                            placeholder="Search query...",
                             show_label=False,
                             scale=7,
                             container=False,
@@ -476,70 +465,91 @@ def run_gradio():
                         search_btn = gr.Button("Search", scale=1)
                     search_result = gr.Markdown(label="Search result")
 
-            # ── Right: memory panel ───────────────────────────
+            # ── Right: limbiq panel ──────────────────────────
             with gr.Column(scale=2, elem_classes="memory-col"):
                 with gr.Tabs():
-                    with gr.Tab("Overview"):
-                        overview_md = gr.Markdown(
-                            value=_overview_md,
+                    with gr.Tab("Memory"):
+                        memory_display = gr.Markdown(
+                            value=_memory_md,
                             elem_classes="mem-tab-content",
                         )
-                    with gr.Tab("Long-term"):
-                        longterm_md = gr.Markdown(
-                            value=_longterm_md,
+                    with gr.Tab("Priority"):
+                        priority_display = gr.Markdown(
+                            value=_priority_md,
                             elem_classes="mem-tab-content",
                         )
-                    with gr.Tab("Mid-term"):
-                        midterm_md = gr.Markdown(
-                            value=_midterm_md,
+                    with gr.Tab("Signals"):
+                        signal_display = gr.Markdown(
+                            value=_signals_md,
                             elem_classes="mem-tab-content",
                         )
-                    with gr.Tab("Web knowledge"):
-                        web_md = gr.Markdown(
-                            value=_web_md,
+                    with gr.Tab("Suppressed"):
+                        suppressed_display = gr.Markdown(
+                            value=_suppressed_md,
                             elem_classes="mem-tab-content",
                         )
-                        with gr.Row():
-                            decay_btn = gr.Button("Decay", size="sm")
-                            clear_web_btn = gr.Button("Clear all", size="sm", variant="stop")
+                    with gr.Tab("Actions"):
+                        gr.Markdown("**Tag priority memory (Dopamine)**")
+                        dopamine_input = gr.Textbox(placeholder="Enter a fact...")
+                        dopamine_btn = gr.Button("Tag as priority")
+                        dopamine_status = gr.Markdown()
+
+                        gr.Markdown("**Apply correction**")
+                        correct_input = gr.Textbox(placeholder="Enter correction...")
+                        correct_btn = gr.Button("Correct")
+                        correct_status = gr.Markdown()
+
+                        gr.Markdown("---")
+                        good_btn = gr.Button("Last response was good")
 
                 with gr.Row():
-                    refresh_btn = gr.Button("↺ Refresh memory", size="sm")
+                    refresh_btn = gr.Button("Refresh", size="sm")
                     new_session_btn = gr.Button("New session", size="sm", variant="secondary")
 
         # ── Wire events ───────────────────────────────────────
 
-        all_mem_outputs = [overview_md, longterm_md, midterm_md, web_md]
+        all_panel_outputs = [memory_display, priority_display, signal_display, suppressed_display]
 
         # Send message (button or Enter)
         send_btn.click(
             fn=chat,
             inputs=[msg_box, chatbot],
-            outputs=[chatbot, msg_box, *all_mem_outputs],
+            outputs=[chatbot, msg_box, *all_panel_outputs],
         )
         msg_box.submit(
             fn=chat,
             inputs=[msg_box, chatbot],
-            outputs=[chatbot, msg_box, *all_mem_outputs],
+            outputs=[chatbot, msg_box, *all_panel_outputs],
         )
 
         # Web search
         search_btn.click(
             fn=do_search,
             inputs=[search_box],
-            outputs=[search_result, search_box, *all_mem_outputs],
+            outputs=[search_result, search_box, *all_panel_outputs],
         )
         search_box.submit(
             fn=do_search,
             inputs=[search_box],
-            outputs=[search_result, search_box, *all_mem_outputs],
+            outputs=[search_result, search_box, *all_panel_outputs],
         )
 
-        # Memory controls
-        refresh_btn.click(fn=_all_memory, outputs=all_mem_outputs)
-        new_session_btn.click(fn=new_session, outputs=[chatbot, *all_mem_outputs])
-        decay_btn.click(fn=decay_web, outputs=[web_md])
-        clear_web_btn.click(fn=clear_web, outputs=[web_md])
+        # Actions
+        dopamine_btn.click(
+            fn=apply_dopamine,
+            inputs=dopamine_input,
+            outputs=[dopamine_status, *all_panel_outputs],
+        )
+        correct_btn.click(
+            fn=apply_correction,
+            inputs=correct_input,
+            outputs=[correct_status, *all_panel_outputs],
+        )
+        good_btn.click(fn=mark_good, outputs=all_panel_outputs)
+
+        # Controls
+        refresh_btn.click(fn=_all_panels, outputs=all_panel_outputs)
+        new_session_btn.click(fn=new_session, outputs=[chatbot, *all_panel_outputs])
 
     demo.launch(theme=gr.themes.Soft(), css=CSS)
 
