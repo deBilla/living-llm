@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import gradio; print\\(gradio.__version__\\)\")",
+      "Bash(python3 -c \"import gradio; print\\(gradio.__version__\\)\")",
+      "Bash(source venv/bin/activate)",
+      "Bash(source /Users/dimuthu/living-llm/venv/bin/activate)",
+      "Bash(python3 -c \"import gradio as gr; ci = gr.ChatInterface\\(fn=lambda m,h: m\\); print\\(dir\\(ci\\)\\)\")"
+    ]
+  }
+}

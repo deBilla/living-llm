@@ -1,0 +1,21 @@
+# Core
+llama-cpp-python>=0.2.0
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+
+# UI
+rich>=13.0
+gradio>=4.0
+
+# Utilities
+huggingface-hub>=0.20.0
+
+# LoRA training (Apple Silicon — install via pip install mlx-lm)
+# mlx-lm pulls in mlx as a dependency automatically.
+# On first /train, mlx-lm will download the MLX model (~4.5 GB) from HuggingFace.
+mlx-lm>=0.18.0
+
+# Web search and page reading
+ddgs>=0.1  # Renamed from duckduckgo-search
+trafilatura>=1.6
+requests>=2.31
