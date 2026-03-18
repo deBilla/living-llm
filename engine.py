@@ -14,10 +14,12 @@ LoRA training and web search remain in living-llm (limbiq is memory-only).
 
 import re
 import json
+import threading
 
 import config
 from limbiq import Limbiq
-from llm_backend import LLMBackend, MLXBackend
+from limbiq.steering import enable_steering
+from llm_backend import MLXBackend
 from tools.react_loop import ReactLoop
 from tools.web_augment import WebAugmenter
 from training.adapter_manager import AdapterManager
@@ -30,9 +32,21 @@ _TOOL_TAG_RE = re.compile(r"<tool_(?:call|result)>.*?</tool_(?:call|result)>", r
 
 class ConversationEngine:
     def __init__(self):
-        self.llm = LLMBackend()           # llama-cpp, always available (base model)
+        # LoRA adapter state — checked before MLX load
+        self.adapter_manager = AdapterManager()
+        self.trainer = LoRATrainer()
+        self.evaluator = AdapterEvaluator()
+        self._adapter_enabled = True
+        self._pending_adapter: str | None = None
+        self._training_active = False
 
-        # Initialize limbiq with the LLM as the compression engine
+        # ONE model instance — MLX handles everything:
+        # primary generation, LoRA adapters, and steering vectors
+        adapter_path = self.adapter_manager.get_active_adapter() if config.LORA_ENABLED else None
+        self._mlx = MLXBackend(adapter_path=adapter_path)
+        self._mlx.load()
+
+        # Initialize limbiq — uses the same MLX model for compression
         self.lq = Limbiq(
             store_path=config.LIMBIQ_STORE_PATH,
             user_id=config.USER_ID,
@@ -40,11 +54,18 @@ class ConversationEngine:
             llm_fn=self._llm_compress_fn,
         )
 
+        # Steering uses the SAME MLX model — no second load
+        enable_steering(
+            self.lq,
+            model=self._mlx._model,
+            tokenizer=self._mlx._tokenizer,
+        )
+
         self.messages: list[dict] = []
         self._turn_count = 0
 
         # Web search augmentation — bridges limbiq and web search
-        self.web_augmenter = WebAugmenter(self.lq, self.llm)
+        self.web_augmenter = WebAugmenter(self.lq, self._mlx)
 
         # ReAct loop — session-scoped rate limiting persists across turns
         self.react_loop = ReactLoop(
@@ -52,21 +73,9 @@ class ConversationEngine:
             max_calls_per_iteration=2,
         )
 
-        # LoRA adapter state
-        self.adapter_manager = AdapterManager()
-        self.trainer = LoRATrainer()
-        self.evaluator = AdapterEvaluator()
-        self._mlx: MLXBackend | None = None
-        self._adapter_enabled = True
-        self._pending_adapter: str | None = None
-        self._training_active = False
-
-        if config.LORA_ENABLED:
-            self._try_load_active_adapter(quiet=True)
-
     def _llm_compress_fn(self, prompt: str) -> str:
         """Adapter: limbiq needs a simple fn(str) -> str for compression."""
-        return self.llm.chat(
+        return self._mlx.chat(
             [{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0.2,
@@ -82,7 +91,7 @@ class ConversationEngine:
         self.react_loop.reset_session()
 
         stats = self.lq.get_stats()
-        adapter_note = " | adapter: on" if (self._mlx and self._adapter_enabled) else ""
+        adapter_note = " | adapter: on" if (self._adapter_enabled and self._mlx.adapter_path) else ""
         print(f"  Limbiq memory: {stats}{adapter_note}")
 
     def respond(self, user_input: str) -> str:
@@ -146,57 +155,75 @@ class ConversationEngine:
         # can't miss it. Small models pay far more attention to user turns than
         # system content buried early in the context window.
         user_msg = user_input
-        has_context = result.context or web_context
-        if has_context:
-            context_parts = []
-            if result.context:
-                context_parts.append(result.context)
-            if web_context:
-                context_parts.append(
-                    "<web_search_results>\n"
-                    + web_context
-                    + "\n</web_search_results>"
-                )
-            injected = "\n\n".join(context_parts)
+        if result.context and not web_context:
+            # Memory-only: strong instruction to use memory, no web distraction
             user_msg = (
                 f"Here is what you remember about me from past conversations "
-                f"(use this naturally, do NOT mention section names or tags):\n\n"
-                f"{injected}\n\n"
+                f"(use this naturally, do NOT mention section names or tags). "
+                f"Answer using ONLY this memory — do NOT search the web:\n\n"
+                f"{result.context}\n\n"
+                f"Now answer this: {user_input}"
+            )
+        elif result.context and web_context:
+            # Both memory and web: prioritize memory
+            user_msg = (
+                f"Here is what you remember about me (PRIORITY — use this first):\n\n"
+                f"{result.context}\n\n"
+                f"Here are web search results (use ONLY if memory doesn't answer the question):\n\n"
+                f"<web_search_results>\n{web_context}\n</web_search_results>\n\n"
+                f"Now answer this: {user_input}"
+            )
+        elif web_context:
+            # Web-only: no memory available
+            user_msg = (
+                f"<web_search_results>\n{web_context}\n</web_search_results>\n\n"
                 f"Now answer this: {user_input}"
             )
 
         messages.append({"role": "user", "content": user_msg})
 
-        backend = self._active_backend()
-
-        # Step 5: Run ReAct loop (may do additional searches)
-        if config.WEB_SEARCH_ENABLED:
-            response, react_log = self.react_loop.run(backend, messages)
+        # Step 5: Generate response
+        # If memory already has good context, skip the ReAct tool loop entirely —
+        # prevents the model from issuing redundant web searches for things it
+        # already knows from memory.
+        memory_sufficient = result.priority_count > 0 or result.memories_retrieved >= 3
+        if config.WEB_SEARCH_ENABLED and not memory_sufficient:
+            response, react_log = self.react_loop.run(self._mlx, messages)
             search_log.extend(react_log)
 
             bad_urls = self.react_loop.verify_citations(response, search_log)
             if bad_urls:
                 print(f"  [Warning: response mentions unverified URLs: {bad_urls}]")
         else:
-            response = backend.chat(messages)
+            response = self._mlx.chat(messages)
 
         # Clean up any stray tool tags that slipped through
         response = _TOOL_TAG_RE.sub("", response).strip()
 
-        # Step 6: Store exchange and tell limbiq
+        # Step 6: Store exchange and tell limbiq in the BACKGROUND
         self.messages.append({"role": "user", "content": user_input})
         self.messages.append({"role": "assistant", "content": response})
 
-        self.lq.observe(
-            message=user_input,
-            response=response,
-        )
-
-        # Store web facts through limbiq if web searches happened
-        if search_log:
-            self.web_augmenter.store_web_facts(user_input, search_log, response)
+        threading.Thread(
+            target=self._observe_async,
+            args=(user_input, response, list(search_log)),
+            daemon=True,
+        ).start()
 
         return response
+
+    def _observe_async(self, message: str, response: str, search_log: list):
+        """Run limbiq observation and web fact storage in background."""
+        try:
+            self.lq.observe(message=message, response=response)
+        except Exception as e:
+            print(f"  [Limbiq observe error: {e}]")
+
+        if search_log:
+            try:
+                self.web_augmenter.store_web_facts(message, search_log, response)
+            except Exception as e:
+                print(f"  [Web fact storage error: {e}]")
 
     def end_session(self):
         """End session — limbiq handles all consolidation."""
@@ -264,7 +291,7 @@ class ConversationEngine:
             },
         ]
 
-        response = self._active_backend().chat(messages)
+        response = self._mlx.chat(messages)
 
         # Store web facts through limbiq
         search_log = [{"type": "search", "query": query, "results": results}]
@@ -299,39 +326,51 @@ class ConversationEngine:
 
     def adapter_on(self) -> bool:
         """Re-enable the LoRA adapter."""
+        adapter_path = self.adapter_manager.get_active_adapter()
+        if not adapter_path:
+            print("  No adapter found. Run /train first.")
+            return False
         self._adapter_enabled = True
-        if self._mlx is None:
-            self._try_load_active_adapter(quiet=False)
-        if self._mlx:
-            print("  Adapter enabled.")
-            return True
-        print("  No adapter found. Run /train first.")
-        return False
+        # Reload MLX with the adapter
+        self._mlx.unload()
+        self._mlx = MLXBackend(adapter_path=adapter_path)
+        self._mlx.load()
+        print("  Adapter enabled.")
+        return True
 
     def adapter_off(self):
-        """Disable the adapter (fall back to base model)."""
+        """Disable the adapter (reload base model without adapter)."""
         self._adapter_enabled = False
+        self._mlx.unload()
+        self._mlx = MLXBackend()
+        self._mlx.load()
         print("  Adapter disabled — using base model.")
 
     def compare_responses(self, prompt: str) -> dict | None:
         """Run the same prompt through base and adapted model."""
-        if self._mlx is None or not self._mlx.is_loaded():
+        adapter_path = self.adapter_manager.get_active_adapter()
+        if not adapter_path:
             print("  No adapter loaded. Run /train first.")
             return None
 
+        # Temporarily load base model (no adapter) for comparison
         print("  Running base model...")
-        base_resp = self.llm.chat([{"role": "user", "content": prompt}], max_tokens=256, temperature=0.01)
+        base_mlx = MLXBackend()
+        base_mlx.load()
+        base_resp = base_mlx.chat([{"role": "user", "content": prompt}], max_tokens=256, temperature=0.01)
+        base_mlx.unload()
+
         print("  Running adapted model...")
         adapted_resp = self._mlx.chat([{"role": "user", "content": prompt}], max_tokens=256, temperature=0.01)
 
-        comparison = self.evaluator.compare_responses(prompt, self.llm, self._mlx)
-        self.evaluator.log_comparison(comparison, adapter_path=self.adapter_manager.get_active_adapter() or "")
+        comparison = self.evaluator.compare_responses(prompt, base_mlx, self._mlx)
+        self.evaluator.log_comparison(comparison, adapter_path=adapter_path)
 
         return {"prompt": prompt, "base": base_resp, "adapted": adapted_resp}
 
     def get_adapter_status(self) -> dict:
         status = self.adapter_manager.get_status()
-        status["adapter_active"] = self._adapter_enabled and self._mlx is not None and self._mlx.is_loaded()
+        status["adapter_active"] = self._adapter_enabled and self._mlx.adapter_path is not None
         status["training_running"] = self._training_active
         status["mlx_available"] = MLXBackend.is_available()
         status.update(self.evaluator.get_summary())
@@ -343,6 +382,8 @@ class ConversationEngine:
         """Return current memory state for debugging / UI display."""
         return {
             "stats": self.lq.get_stats(),
+            "graph_stats": self.lq.get_graph_stats(),
+            "world_summary": self.lq.get_world_summary(),
             "priority": [m.content for m in self.lq.get_priority_memories()],
             "suppressed_count": len(self.lq.get_suppressed()),
             "recent_signals": [
@@ -354,27 +395,6 @@ class ConversationEngine:
         }
 
     # ── Internal ───────────────────────────────────────────────
-
-    def _active_backend(self):
-        if self._adapter_enabled and self._mlx is not None and self._mlx.is_loaded():
-            return self._mlx
-        return self.llm
-
-    def _try_load_active_adapter(self, quiet: bool = False):
-        adapter_path = self.adapter_manager.get_active_adapter()
-        if not adapter_path:
-            return
-        if not MLXBackend.is_available():
-            if not quiet:
-                print("  mlx_lm not installed — adapter not loaded.")
-            return
-        try:
-            self._mlx = MLXBackend(adapter_path=adapter_path)
-            self._mlx.load()
-        except Exception as e:
-            if not quiet:
-                print(f"  Failed to load adapter: {e}")
-            self._mlx = None
 
     def _start_training_background(self) -> bool:
         training_dir = prepare_training_data(self.lq._core.store)
@@ -410,11 +430,12 @@ class ConversationEngine:
         if not path:
             return
         try:
-            if self._mlx:
-                self._mlx.unload()
+            self._mlx.unload()
             self._mlx = MLXBackend(adapter_path=path)
             self._mlx.load()
             print("  [New adapter loaded — adapted model now active]")
         except Exception as e:
             print(f"  [Adapter load failed: {e}]")
-            self._mlx = None
+            # Fallback: reload base model without adapter
+            self._mlx = MLXBackend()
+            self._mlx.load()

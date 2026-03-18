@@ -75,6 +75,7 @@ def run_terminal():
                 "  [bold]/signals[/bold]          recent signal history\n"
                 "  [bold]/priority[/bold]         dopamine-tagged memories\n"
                 "  [bold]/suppress[/bold]         GABA-suppressed memories\n"
+                "  [bold]/graph[/bold]            knowledge graph (entities + relations)\n"
                 "  [bold]/dopamine <fact>[/bold]  tag a fact as high-priority\n"
                 "  [bold]/correct <info>[/bold]   correct a wrong memory\n"
                 "  [bold]/good[/bold]             mark last response as positive\n"
@@ -98,6 +99,7 @@ def run_terminal():
             print("  /signals             — recent signal history")
             print("  /priority            — dopamine-tagged memories")
             print("  /suppress            — GABA-suppressed memories")
+            print("  /graph               — knowledge graph")
             print("  /dopamine <fact>     — tag fact as priority")
             print("  /correct <info>      — correct a wrong memory")
             print("  /good                — positive feedback")
@@ -210,6 +212,39 @@ def run_terminal():
                     print(f"  [{m.id[:8]}] {m.content} (reason: {m.suppression_reason})")
             else:
                 print("  No suppressed memories.")
+            continue
+
+        if user_input.lower() in ("/graph", "/g"):
+            stats = engine.lq.get_graph_stats()
+            print(f"\n  Graph: {stats['entities']} entities, {stats['relations']} relations, {stats['inferred']} inferred")
+            entities = engine.lq.get_entities()
+            if entities:
+                print("\n  Entities:")
+                for e in entities:
+                    print(f"    [{e.entity_type or '?'}] {e.name}")
+            relations = engine.lq.get_relations(include_inferred=False)
+            if relations:
+                all_entities = {e.id: e for e in entities}
+                print("\n  Relations:")
+                for r in relations:
+                    subj = all_entities.get(r.subject_id)
+                    obj = all_entities.get(r.object_id)
+                    s_name = subj.name if subj else "?"
+                    o_name = obj.name if obj else "?"
+                    print(f"    {s_name} --[{r.predicate}]--> {o_name}")
+            inferred = [r for r in engine.lq.get_relations() if r.is_inferred]
+            if inferred:
+                all_entities = {e.id: e for e in entities}
+                print("\n  Inferred:")
+                for r in inferred:
+                    subj = all_entities.get(r.subject_id)
+                    obj = all_entities.get(r.object_id)
+                    s_name = subj.name if subj else "?"
+                    o_name = obj.name if obj else "?"
+                    print(f"    {s_name} --[{r.predicate}]--> {o_name}")
+            world = engine.lq.get_world_summary()
+            if world:
+                print(f"\n  World summary: {world}")
             continue
 
         if user_input.lower().startswith("/dopamine "):

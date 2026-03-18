@@ -197,7 +197,7 @@ class MLXBackend:
             prompt = self._format_llama3(messages)
 
         temp = temperature if temperature is not None else config.TEMPERATURE
-        sampler = make_sampler(temp=temp)
+        sampler = make_sampler(temp=temp, min_p=0.05)
 
         response = generate(
             self._model,
@@ -215,7 +215,27 @@ class MLXBackend:
             if stop in response:
                 response = response[:response.index(stop)]
 
+        # Detect and truncate repetition loops
+        response = self._truncate_repetition(response)
+
         return response.strip()
+
+    @staticmethod
+    def _truncate_repetition(text: str, min_phrase_len: int = 20) -> str:
+        """Detect repeating phrases and truncate at the first repetition."""
+        if len(text) < min_phrase_len * 3:
+            return text
+        # Check if any substring of length min_phrase_len..100 repeats 3+ times
+        for phrase_len in range(min_phrase_len, min(100, len(text) // 3)):
+            for start in range(len(text) - phrase_len * 3):
+                phrase = text[start:start + phrase_len]
+                count = text.count(phrase)
+                if count >= 3:
+                    # Found a repeating phrase — truncate at second occurrence
+                    first = text.index(phrase)
+                    second = text.index(phrase, first + phrase_len)
+                    return text[:second].rstrip(", ").rstrip()
+        return text
 
     def is_loaded(self) -> bool:
         return self._loaded

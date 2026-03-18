@@ -1,6 +1,6 @@
 # Living LLM
 
-A locally-running language model with persistent memory, neurotransmitter-inspired learning, web-augmented recall, LoRA neuroplasticity, and a full agent tool suite. Powered by [limbiq](https://github.com/deBilla/limbiq). Runs entirely on Apple Silicon.
+A locally-running language model with persistent memory, neurotransmitter-inspired learning, knowledge graph reasoning, web-augmented recall, LoRA neuroplasticity, and a full agent tool suite. Powered by [limbiq](https://github.com/deBilla/limbiq). Runs entirely on Apple Silicon.
 
 ## Architecture
 
@@ -12,27 +12,29 @@ A locally-running language model with persistent memory, neurotransmitter-inspir
 ┌──────────────────────────▼──────────────────────────────┐
 │                  Conversation Engine                      │
 │                                                          │
-│  lq.process(msg) ──→ Build prompt ──→ LLM ──→ lq.observe│
-│       │                    │                │            │
-│  Memory context      Web augment if    ReAct tool loop   │
-│  from limbiq         few memories      (13 tools)        │
+│  lq.process(msg) ──→ Build prompt ──→ MLX ──→ lq.observe│
+│       │                    │              │   (async)    │
+│  Graph query first    Web augment if   ReAct tool loop   │
+│  + world summary      few memories     (13 tools)        │
+│  + memory context                                        │
 │       └────────────────────┴────────────────┘            │
 │                            │                             │
 │                   lq.end_session()                        │
-│              (compress + suppress stale)                  │
-└────┬──────────────────┬──────────────────┬──────────────┘
-     │                  │                  │
-┌────▼────────┐  ┌──────▼───────┐  ┌──────▼───────────────┐
-│ LLM Backend │  │   Limbiq     │  │ LoRA Adapter (MLX)   │
-│ llama.cpp   │  │              │  │                      │
-│ Metal GPU   │  │ Dopamine     │  │ Trains on compressed │
-│             │  │ (priority)   │  │ conversations        │
-│ Llama 3.1   │  │ GABA         │  │ Auto-loads on next   │
-│ 8B Q4_K_M   │  │ (suppress)   │  │ message              │
-│             │  │ SQLite +     │  │                      │
-│             │  │ Embeddings   │  │                      │
-└─────────────┘  └──────────────┘  └──────────────────────┘
+│         (compress + graph inference + suppress stale)     │
+└────┬───────────────────────┬───────────────────┬────────┘
+     │                       │                   │
+┌────▼────────────┐  ┌──────▼───────┐  ┌────────▼─────────┐
+│ MLX Backend     │  │   Limbiq     │  │ Activation       │
+│ (single model)  │  │              │  │ Steering         │
+│                 │  │ 5 Signals    │  │                  │
+│ Llama 3.1 8B   │  │ Knowledge    │  │ Shares the same  │
+│ 4-bit quantized │  │ Graph        │  │ MLX model — no   │
+│                 │  │ SQLite +     │  │ second load      │
+│ + LoRA adapter  │  │ Embeddings   │  │                  │
+└─────────────────┘  └──────────────┘  └──────────────────┘
 ```
+
+**Single model architecture:** One MLX model instance serves all purposes — primary generation, LoRA adapter inference, limbiq compression, and activation steering. No more llama.cpp + MLX duplication.
 
 ## Limbiq Signals
 
@@ -42,10 +44,35 @@ Living LLM delegates all memory management to **limbiq**, a neurotransmitter-ins
 |--------|---------|---------------|
 | **Dopamine** | "This matters, remember it" | Personal info shared, corrections, positive feedback |
 | **GABA** | "Suppress this, let it fade" | Denials, contradictions, stale memories |
+| **Serotonin** | "This is a behavioral pattern" | Repeated user preferences → crystallized rules |
+| **Acetylcholine** | "Focus on this domain" | Sustained topic discussion → knowledge clusters |
+| **Norepinephrine** | "Topic shifted, be careful" | Abrupt topic changes → widened retrieval + caution |
 
 - **Dopamine-tagged** memories are always included in context (priority)
 - **GABA-suppressed** memories are excluded from retrieval but can be restored
 - **Corrections** combine both: dopamine on new info + GABA on old
+- **Serotonin rules** shape response style (concise, casual, technical, etc.)
+- **Acetylcholine clusters** group domain knowledge for deep topic recall
+- **Norepinephrine** widens retrieval and adds caution flags on topic shifts
+
+## Knowledge Graph
+
+Limbiq builds a personal knowledge graph from conversations — entities (people, places, companies) and relationships (father, wife, works_at). A deterministic inference engine computes implied relationships without using the LLM:
+
+```
+User tells limbiq:
+  "My father is Upananda"     →  Dimuthu --[father]--> Upananda
+  "My wife is Prabhashi"      →  Dimuthu --[wife]--> Prabhashi
+
+Limbiq infers (no LLM needed):
+  Upananda --[father_in_law_of]--> Prabhashi
+```
+
+**Token efficiency:** Instead of injecting 5 raw memory strings (~200 tokens), the graph produces a compact world summary (~40 tokens):
+
+> "Your father is Upananda (Prabhashi's father-in-law). Your wife is Prabhashi. You work at Bitsmedia."
+
+Graph queries ("Who is Upananda to my wife?") are answered deterministically — zero LLM cost, ~15 tokens injected.
 
 ## Memory Tiers
 
@@ -55,7 +82,7 @@ Living LLM delegates all memory management to **limbiq**, a neurotransmitter-ins
 | **MID** | Atomic facts compressed from conversations | Created at session end |
 | **PRIORITY** | Dopamine-tagged high-importance facts | Always included in context |
 
-Limbiq handles compression via `end_session()` — conversations are distilled into atomic facts, stale memories are suppressed, and old suppressed memories are deleted.
+Limbiq handles compression via `end_session()` — conversations are distilled into atomic facts, entities are extracted into the knowledge graph, inference runs, stale memories are suppressed, and old suppressed memories are deleted.
 
 ## Agent Tools
 
@@ -77,24 +104,40 @@ The model has access to 13 tools via a ReAct (Reason-Act) loop:
 | `http_get` | HTTP GET to any URL/API |
 | `http_post` | HTTP POST with JSON body |
 
-Tools are called by the model using `<tool_call>` XML tags. The ReAct loop intercepts, executes, and feeds results back until the model produces a final answer.
+Tools are called by the model using `<tool_call>` XML tags. The ReAct loop intercepts, executes, and feeds results back until the model produces a final answer. When memory already answers the question, the ReAct loop is skipped entirely to avoid redundant web searches.
 
 ## Web Search Augmentation
 
 When limbiq returns few or no memories for a query, the web augmenter kicks in:
 
-1. Check if the query is searchable (keyword heuristic + LLM fallback)
+1. Check if the query is searchable (keyword heuristic — no LLM fallback)
 2. Search the web via DuckDuckGo/SearXNG
 3. Inject results as additional context
 4. Extract durable facts and store them via `lq.dopamine()` with `[Web]` prefix
+
+Memory-first priority: if limbiq has good context (priority memories or 3+ relevant memories), web search is skipped entirely.
 
 ## LoRA Neuroplasticity
 
 - After ≥3 compressed conversations, LoRA fine-tuning runs via `mlx_lm` on Apple Silicon
 - Trains on the MLX-format model (`mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`)
-- Base GGUF model stays untouched; adapted inference uses `MLXBackend`
+- Same MLX model serves both base and adapted inference (single instance)
 - Training runs in a background thread; adapter loads on next message
 - Old adapters are cleaned up (keeps last 5)
+
+## Activation Steering
+
+Limbiq maps neurotransmitter signals to steering vectors injected at specific transformer layers:
+
+| Signal | Steering Effect |
+|--------|----------------|
+| Dopamine | Amplify attention to memory context + confidence |
+| GABA | Increase honesty + decrease confidence |
+| Serotonin | Persona vectors based on crystallized rules |
+| Norepinephrine | Heightened caution + memory attention |
+| Acetylcholine | Technical depth + helpfulness |
+
+Steering vectors are injected during the forward pass at target layers only — non-steered layers have zero overhead. The steering model shares the same MLX model instance as primary generation.
 
 ## Setup
 
@@ -114,6 +157,9 @@ source venv/bin/activate
 # Core (Metal GPU acceleration)
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/metal
 pip install -r requirements.txt
+
+# For development with local limbiq:
+pip install -e ../limbiq
 ```
 
 ### Download model
@@ -124,7 +170,7 @@ huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
   Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --local-dir models/
 ```
 
-The MLX model for LoRA training downloads automatically on first `/train` (~4.5 GB).
+The MLX model for LoRA training and inference downloads automatically on first run (~4.5 GB).
 
 ### Run
 
@@ -134,16 +180,22 @@ python main.py
 
 # Gradio web UI
 python main.py --ui
+
+# Standalone consolidation
+python consolidate.py          # Single cycle
+python consolidate.py --stats  # Memory stats
+python consolidate.py --train  # Consolidate + trigger LoRA training
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/memory` | Inspect limbiq memory state |
-| `/signals` | Show recent signal history (dopamine/GABA events) |
+| `/memory` | Inspect limbiq memory state + graph stats |
+| `/signals` | Show recent signal history (all 5 neurotransmitters) |
 | `/priority` | Show all dopamine-tagged priority memories |
 | `/suppress` | Show all GABA-suppressed memories |
+| `/graph` | Show knowledge graph — entities, relations, inferences |
 | `/dopamine <fact>` | Manually tag a fact as high-priority |
 | `/gaba <id>` | Manually suppress a memory by ID |
 | `/correct <info>` | Correct a wrong memory (dopamine new + GABA old) |
@@ -157,15 +209,15 @@ python main.py --ui
 | `/adapter compare` | Compare base vs adapted model |
 | `/adapter off\|on` | Toggle LoRA adapter |
 | `/new` | Start a new session |
-| `/quit` | End session (triggers compression) |
+| `/quit` | End session (triggers compression + graph inference) |
 
 ## Project Structure
 
 ```
 living-llm/
 ├── main.py                  # Entry point — terminal chat + Gradio UI
-├── engine.py                # Thin orchestrator — limbiq + LLM + tools
-├── llm_backend.py           # LLM backends (llama-cpp + MLX)
+├── engine.py                # Thin orchestrator — limbiq + MLX + tools
+├── llm_backend.py           # MLX backend (single model for everything)
 ├── config.py                # All configuration
 ├── consolidate.py           # Standalone consolidation + training trigger
 ├── eval_confabulation.py    # Confabulation test suite
@@ -191,7 +243,7 @@ living-llm/
 │   └── eval.py              # Base vs adapted response comparison
 ├── models/                  # GGUF models (gitignored)
 └── data/                    # All persistent state (gitignored)
-    ├── limbiq/              # Limbiq's memory store
+    ├── limbiq/              # Limbiq's memory store + knowledge graph
     ├── training/            # LoRA training data
     ├── adapters/            # LoRA adapter checkpoints
     └── metrics/             # Evaluation logs
@@ -199,14 +251,16 @@ living-llm/
 
 ## How It Works
 
-1. **You chat** → limbiq processes the message and returns enriched memory context
-2. **Context injection** → memory injected directly into the user message so the 8B model reliably uses it
-3. **Web augmentation** → if limbiq has few memories, web search fills the gap
-4. **ReAct tools** → model can call 13 tools (search, code, weather, files, etc.) during response generation
-5. **Observe** → limbiq observes the exchange, fires dopamine/GABA signals as appropriate
-6. **Compression** → on `/quit`, `lq.end_session()` compresses conversations into atomic facts and suppresses stale memories
-7. **LoRA training** → when enough conversations accumulate, a LoRA adapter trains in the background
-8. **Next conversation** → the model remembers you, uses its tools, and gets better over time
+1. **You chat** → limbiq queries the knowledge graph first, then retrieves memories
+2. **Context injection** → graph answer + compact world summary + ungraphed memories injected into user message
+3. **Memory-first routing** → if memory answers the question, web search and ReAct loop are skipped
+4. **Web augmentation** → if limbiq has few memories, web search fills the gap
+5. **ReAct tools** → model can call 13 tools during response generation (only when memory is insufficient)
+6. **Async observe** → limbiq observes the exchange in a background thread (doesn't block response)
+7. **Entity extraction** → limbiq extracts entities and relationships from every exchange into the graph
+8. **Compression** → on `/quit`, conversations are compressed, graph inference runs, stale memories are suppressed
+9. **LoRA training** → when enough conversations accumulate, a LoRA adapter trains in the background
+10. **Next conversation** → the model remembers you, reasons about relationships, and gets better over time
 
 ## Migration
 

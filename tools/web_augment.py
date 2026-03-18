@@ -8,7 +8,6 @@ trigger a web search and store findings through limbiq's API.
 import time
 
 from limbiq import Limbiq
-from llm_backend import LLMBackend
 import config
 
 
@@ -32,7 +31,7 @@ _NOT_SEARCHABLE = [
 class WebAugmenter:
     """Bridges limbiq's memory system and web search."""
 
-    def __init__(self, lq: Limbiq, llm: LLMBackend):
+    def __init__(self, lq: Limbiq, llm):
         self.lq = lq
         self.llm = llm
 
@@ -130,14 +129,5 @@ class WebAugmenter:
             if signal in query_lower:
                 return True
 
-        # Ambiguous — let the LLM decide (cheap call)
-        decision = self.llm.chat(
-            [{"role": "user", "content": (
-                "Would searching the internet help answer this question? "
-                f'Just reply YES or NO.\n\nQuestion: "{query}"'
-            )}],
-            max_tokens=5,
-            temperature=0.0,
-        ).strip().upper()
-
-        return "YES" in decision
+        # Ambiguous — default to NOT searching (avoids LLM call overhead)
+        return False
